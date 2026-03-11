@@ -1,0 +1,110 @@
+from __future__ import annotations
+
+import numpy as np
+import pytest
+
+from evcharge.optim import (
+    LPSession,
+    ScheduleProblem,
+    problem_from_scenario,
+    relaxation_bound,
+    solve_schedule,
+)
+
+from .helpers import make_scenario, session
+
+
+def problem(sessions: tuple[LPSession, ...], **kwargs: object) -> ScheduleProblem:
+    n = 4
+    defaults: dict[str, object] = {
+        "dt_h": 1.0,
+        "price": np.array([0.3, 0.1, 0.2, 0.4]),
+        "export_price": np.zeros(n),
+        "net_base_kw": np.zeros(n),
+        "grid_limit_kw": 20.0,
+        "demand_charge": 0.0,
+        "sessions": sessions,
+    }
+    defaults.update(kwargs)
+    return ScheduleProblem(**defaults)  # type: ignore[arg-type]
+
+
+def lp_session(energy: float, *, p_min: float = 0.0, start: int = 0, end: int = 4) -> LPSession:
+    return LPSession("A", start, end, energy, 1.0, p_min, 11.0)
+
+
+def test_lp_fills_cheapest_steps() -> None:
+    sol = solve_schedule(problem((lp_session(15.0),)))
+    np.testing.assert_allclose(sol.power_kw[0], [0, 11, 4, 0], atol=1e-8)
+    assert sol.objective == pytest.approx(0.1 * 11 + 0.2 * 4)
+    assert sol.lower_bound == pytest.approx(sol.objective)
+    assert sol.gap == pytest.approx(0.0)
+    assert sol.n_binaries == 0
+
+
+def test_unmet_energy_is_penalised_not_infeasible() -> None:
+    sol = solve_schedule(problem((lp_session(100.0),), unmet_penalty=10.0))
+    np.testing.assert_allclose(sol.power_kw[0], [11, 11, 11, 11], atol=1e-8)
+    assert sol.unmet_kwh[0] == pytest.approx(56.0)
+
+
+def test_semicontinuous_minimum_power() -> None:
+    # 6 kWh with p_min 4.14: the LP would put 6 kW in the cheapest step anyway,
+    # but 2 x 3 kW is forbidden; make splitting attractive with a demand charge.
+    relaxed = solve_schedule(
+        problem((lp_session(6.0, p_min=4.14),), demand_charge=1.0, min_power_steps=0)
+    )
+    exact = solve_schedule(problem((lp_session(6.0, p_min=4.14),), demand_charge=1.0))
+    assert relaxed.power_kw.max() < 4.14  # fractional in the relaxation
+    p = exact.power_kw[0]
+    assert np.all((p == 0) | (p >= 4.14 - 1e-9))
+    assert exact.n_binaries == 4
+    assert exact.objective >= relaxed.objective - 1e-9
+
+
+def test_minimum_power_can_finish_small_requests() -> None:
+    # 1 kWh is below one step at p_min: commanding p_min is allowed (overshoot).
+    sol = solve_schedule(problem((lp_session(1.0, p_min=4.14),)))
+    assert sol.unmet_kwh[0] == pytest.approx(0.0, abs=1e-9)
+    assert sol.power_kw[0, 1] == pytest.approx(4.14)
+
+
+def test_relax_and_fix_matches_or_bounds_exact() -> None:
+    sessions = tuple(
+        LPSession(f"S{i}", 0, 4, e, 1.0, 4.14, 11.0) for i, e in enumerate([6.0, 9.0, 13.0])
+    )
+    kw = {"demand_charge": 0.5, "grid_limit_kw": 15.0}
+    exact = solve_schedule(problem(sessions, **kw), strategy="exact")
+    fixed = solve_schedule(problem(sessions, **kw), strategy="relax-and-fix")
+    assert exact.objective <= fixed.objective + 1e-7
+    assert fixed.lower_bound <= exact.objective + 1e-7
+    assert fixed.n_binaries <= exact.n_binaries
+
+
+def test_peak_floor_and_export() -> None:
+    sol = solve_schedule(
+        problem(
+            (lp_session(8.0),),
+            net_base_kw=np.array([0.0, -5.0, 0.0, 0.0]),
+            export_price=np.array([0.0, 0.05, 0.0, 0.0]),
+            demand_charge=1.0,
+            peak_floor_kw=7.0,
+        )
+    )
+    assert sol.peak_kw == pytest.approx(7.0)
+    # the PV surplus in step 1 (worth only 0.05) is used first
+    assert sol.power_kw[0, 1] >= 5.0 - 1e-8
+    assert sol.export_kw[1] == pytest.approx(0.0, abs=1e-8)
+
+
+def test_window_validation() -> None:
+    with pytest.raises(ValueError, match="outside"):
+        solve_schedule(problem((lp_session(1.0, start=2, end=6),)))
+
+
+def test_scenario_helpers() -> None:
+    sc = make_scenario([session("A", "C1", 1, 3, 5.0)], prices=[0.3, 0.1, 0.2, 0.4])
+    prob = problem_from_scenario(sc)
+    assert prob.sessions[0].start == 1
+    assert prob.sessions[0].end == 3
+    assert relaxation_bound(sc) == pytest.approx(0.5)
