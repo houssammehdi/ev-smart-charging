@@ -152,6 +152,18 @@ class ScheduleSolution:
         return max(0.0, self.objective - self.lower_bound) / max(1e-9, abs(self.objective))
 
 
+NUMERIC_ZERO = 1e-9
+"""Coefficients smaller than this in magnitude are treated as exactly zero.
+
+HiGHS can stall on MILPs whose data contains denormal-scale values (for example a
+price of 1e-308); snapping them to zero changes the objective by a negligible amount.
+"""
+
+
+def _snap(values: FloatArray) -> FloatArray:
+    return np.where(np.abs(values) < NUMERIC_ZERO, 0.0, values)
+
+
 class _Model:
     """Sparse matrices of one :class:`ScheduleProblem`, reusable across solves."""
 
@@ -196,11 +208,12 @@ class _Model:
         c[self.off_e : self.off_peak] = -problem.export_price * dt
         c[self.off_peak] = problem.demand_charge
         c[self.off_u : self.off_o] = problem.unmet_penalty
-        self.c = c
+        self.c = _snap(c)
 
         lb = np.zeros(self.n_cont)
         ub = np.full(self.n_cont, np.inf)
-        lb[self.off_peak] = max(0.0, problem.peak_floor_kw)
+        floor = problem.peak_floor_kw
+        lb[self.off_peak] = floor if floor >= NUMERIC_ZERO else 0.0
         ub[self.off_u : self.off_o] = energy
         # Commanding p_min to finish a request is allowed: the EV stops by itself.
         ub[self.off_o :] = np.where(has_min, eta * p_min * dt, 0.0)
@@ -232,13 +245,13 @@ class _Model:
             ]
         )
         self.a_eq = coo_matrix((vals, (rows, cols)), shape=(n_t + n_s, self.n_cont)).tocsr()
-        self.b_eq = np.concatenate([-problem.net_base_kw, energy])
+        self.b_eq = _snap(np.concatenate([-problem.net_base_kw, energy]))
         # Site headroom: sum_s p <= L - (base - pv); peak: g - P <= 0.
         rows = np.concatenate([p_time, n_t + t_idx, n_t + t_idx])
         cols = np.concatenate([cols_p, self.off_g + t_idx, np.full(n_t, self.off_peak)])
         vals = np.concatenate([np.ones(n_p), np.ones(n_t), -np.ones(n_t)])
         self.a_ub = coo_matrix((vals, (rows, cols)), shape=(2 * n_t, self.n_cont)).tocsr()
-        headroom = np.maximum(0.0, problem.grid_limit_kw - problem.net_base_kw)
+        headroom = _snap(np.maximum(0.0, problem.grid_limit_kw - problem.net_base_kw))
         self.b_ub = np.concatenate([headroom, np.zeros(n_t)])
 
     def solve(
@@ -294,7 +307,14 @@ class _Model:
         a_ub = vstack([hstack([self.a_ub, csr_matrix((self.a_ub.shape[0], n_y))]), link]).tocsr()
         b_ub = np.concatenate([self.b_ub, np.zeros(2 * n_y)])
         integrality = np.concatenate([np.zeros(self.n_cont), np.ones(n_y)])
-        options: dict[str, float | bool] = {"disp": False, "mip_rel_gap": mip_rel_gap}
+        # HiGHS presolve is disabled for MILPs: on some tiny instances its postsolve
+        # path re-runs the solver and prints debug output to stdout; the MILPs built
+        # here are small (MPC) or already reduced by the LP (relax-and-fix).
+        options: dict[str, float | bool] = {
+            "disp": False,
+            "presolve": False,
+            "mip_rel_gap": mip_rel_gap,
+        }
         if time_limit_s is not None:
             options["time_limit"] = time_limit_s
         res = milp(

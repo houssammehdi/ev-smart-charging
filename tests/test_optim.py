@@ -108,3 +108,26 @@ def test_scenario_helpers() -> None:
     assert prob.sessions[0].start == 1
     assert prob.sessions[0].end == 3
     assert relaxation_bound(sc) == pytest.approx(0.5)
+
+
+def test_denormal_coefficients_do_not_stall_the_solver() -> None:
+    # Regression: found by hypothesis. With a price of 2.2e-308 HiGHS' MILP never
+    # returned; such coefficients are now snapped to zero before solving.
+    prob = ScheduleProblem(
+        dt_h=1.0,
+        price=np.array([2.2250738585072014e-308]),
+        export_price=np.array([-0.03888369]),
+        net_base_kw=np.array([-3.24667145]),
+        grid_limit_kw=4.3521814144702144,
+        demand_charge=1e-9,
+        sessions=(
+            LPSession("S0", 0, 1, 52.015842698016804, 0.9447376711126765, 1.38, 2.5452732418727146),
+            LPSession("S1", 0, 1, 43.58103384472968, 0.99999, 1.38, 7.418988493042832),
+        ),
+        peak_floor_kw=4.107320700251546,
+        min_power_steps=1,
+        quick_charge_weight=0.002,
+    )
+    sol = solve_schedule(prob)
+    assert sol.status == "optimal"
+    assert sol.power_kw.sum() == pytest.approx(4.3521814144702144 + 3.24667145)
