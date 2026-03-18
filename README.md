@@ -209,7 +209,7 @@ $\underline{p}_s \le \overline{p}_s$ and unmet-energy penalty $\rho$:
 $$
 \begin{aligned}
 \min_{p,\,g,\,e,\,P,\,u,\,o,\,y}\quad
-  & \sum_{t} \Delta t \left( \pi_t\, g_t - \pi^{\mathrm{exp}}_t\, e_t \right) + D\,P + \rho \sum_s u_s \\
+  & \sum_{t} \Delta t \left( \pi_t\, g_t - \pi^{\mathrm{exp}}_t\, e_t \right) + D\,P + \rho \sum_s u_s + \sum_s \kappa_s\, o_s \\
 \text{s.t.}\quad
   & g_t - e_t = B_t - V_t + \sum_{s} p_{s,t} && \forall t \quad \text{(power balance)}\\
   & \sum_{s} p_{s,t} \le L - B_t + V_t && \forall t \quad \text{(grid limit)}\\
@@ -226,8 +226,11 @@ $$
   ($\pi_t + D / (\eta \Delta t)$), so the optimiser delivers everything it physically can before
   it looks at cost.
 - $o_s$ is *overshoot*: a command of $\underline{p}_s$ may finish a request of less than one
-  minimum step, because the EV stops by itself. Overshoot is paid for in the model and never
-  delivered in the simulator, so the model slightly overestimates cost in those finishing steps.
+  minimum step, because the EV stops by itself. Overshoot energy is commanded but never drawn.
+  It is paid for at the import price and, in addition, at
+  $\kappa_s = \max(0, -\min_{t \in \mathcal{T}_s} \pi^{\mathrm{exp}}_t) / \eta_s$, so that
+  undrawn energy can never count as revenue when export prices are negative. The MILP objective
+  is then an upper bound on the cost of replaying its plan in the simulator.
 - Drop the $y$ constraints ($\underline{p}_s = 0$) and the problem is an LP. With $P_0 = 0$, its
   optimum is a **lower bound** on the penalised cost
   $\text{energy} + \text{demand} + \rho \cdot \text{unmet}$ of *any* schedule the simulator can

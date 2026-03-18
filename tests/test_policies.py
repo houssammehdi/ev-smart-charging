@@ -166,6 +166,24 @@ def test_optimal_respects_minimum_power_with_both_strategies() -> None:
     assert costs[0] <= costs[1] + 1e-6  # exact MILP is never worse
 
 
+def test_overshoot_is_not_fictitious_revenue_at_negative_prices() -> None:
+    # Regression: the overshoot slack (energy commanded at p_min but never drawn)
+    # was only paid for at the import price. At a negative price that is revenue,
+    # so the MILP planned 5.14 kW for a 1 kWh request and reported -2.57 EUR while
+    # the replay costs -0.50 EUR. The plan must bound its own execution from above.
+    sc = make_scenario(
+        [session("A", "C1", 0, 1, 1.0, min_kw=4.14)],
+        n_steps=1,
+        prices=[-0.5],
+        export_prices=[-0.5],
+    )
+    opt = OptimalSchedule()
+    executed = compute_metrics(simulate(sc, opt)).penalised_cost_eur
+    assert executed == pytest.approx(-0.5)
+    assert opt.solution.objective >= executed - 1e-9
+    assert opt.solution.objective == pytest.approx(-0.5)
+
+
 def test_mpc_reoptimises_online() -> None:
     # B arrives unannounced at step 2 and needs the whole remaining capacity
     sc = make_scenario(

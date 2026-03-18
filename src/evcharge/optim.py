@@ -22,8 +22,12 @@ Minimum-power (IEC 61851 6 A) steps are modelled as semi-continuous variables,
 ``p = 0`` or ``p_min <= p <= p_max``, using the binaries ``y``. Because an EV
 stops drawing power once its request is met, commanding ``p_min`` for the
 final few hundred Wh is allowed; the model captures this with an overshoot
-variable ``o <= eta * p_min * dt`` whose energy is paid for but not delivered,
-which makes the MILP cost a slight over-estimate in those rare finishing steps.
+variable ``o <= eta * p_min * dt``: energy that is commanded but never drawn.
+The plan pays for it at the import price, and in addition at the most negative
+export price of the session's window (zero if no export price is negative), so
+that undrawn energy can never look like revenue. With that term the MILP
+objective is an upper bound on the cost the simulator measures when the plan
+is replayed, and the LP relaxation (no overshoot) is a lower bound.
 """
 
 from __future__ import annotations
@@ -221,6 +225,16 @@ class _Model:
         c[self.off_e : self.off_peak] = -problem.export_price * dt
         c[self.off_peak] = problem.demand_charge
         c[self.off_u : self.off_o] = problem.unmet_penalty
+        # Overshoot is paid for at the import price but never drawn. Undrawn grid
+        # energy can raise the executed cost by at most the most negative export
+        # price in the window (the cost of a step is convex in its consumption with
+        # slopes between the export and the import price), so charge that here:
+        # the objective then bounds the executed cost from above.
+        if n_s:
+            window_min_export = np.array(
+                [float(problem.export_price[s.start : s.end].min()) for s in sessions]
+            )
+            c[self.off_o :] = np.maximum(0.0, -window_min_export) / eta
         self.c = _snap(c)
 
         lb = np.zeros(self.n_cont)

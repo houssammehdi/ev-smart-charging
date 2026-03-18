@@ -5,6 +5,7 @@ Only guaranteed properties are asserted:
 * every policy keeps within the physical limits (site, charger/EV, window,
   minimum current, energy request) and triggers no violations;
 * the LP relaxation bounds every executed schedule's penalised cost from below;
+* the offline MILP objective bounds the cost of its own replay from above;
 * without minimum powers the offline optimum is a pure LP, so its cost is no
   higher than any policy's;
 * with perfect information (all EVs present from the start) and no
@@ -144,6 +145,17 @@ def test_relaxation_bounds_every_policy(sc: Scenario) -> None:
     for policy in all_policies():
         m = compute_metrics(simulate(sc, policy))  # type: ignore[arg-type]
         assert bound <= m.penalised_cost_eur + cost_tol(bound), policy
+
+
+@PROPERTY_SETTINGS
+@given(scenarios())
+def test_optimal_plan_bounds_its_replay_from_above(sc: Scenario) -> None:
+    # The replay can only draw less than planned (an EV stops when full); the plan
+    # prices that undrawn energy conservatively, even at negative export prices.
+    opt = OptimalSchedule()
+    executed = compute_metrics(simulate(sc, opt)).penalised_cost_eur
+    assert relaxation_bound(sc) <= executed + cost_tol(executed)
+    assert executed <= opt.solution.objective + cost_tol(executed)
 
 
 @PROPERTY_SETTINGS
