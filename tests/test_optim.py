@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
 from evcharge.optim import (
     LPSession,
     ScheduleProblem,
+    _milp_bound,
     problem_from_scenario,
     relaxation_bound,
     solve_schedule,
@@ -131,3 +134,13 @@ def test_denormal_coefficients_do_not_stall_the_solver() -> None:
     sol = solve_schedule(prob)
     assert sol.status == "optimal"
     assert sol.power_kw.sum() == pytest.approx(4.3521814144702144 + 3.24667145)
+
+
+def test_a_zero_dual_bound_is_kept() -> None:
+    # Regression: ``mip_dual_bound or fun`` treated a proven bound of exactly 0.0 as
+    # missing and reported the incumbent objective as the bound (gap 0 %).
+    assert _milp_bound(SimpleNamespace(mip_dual_bound=0.0, fun=5.0)) == 0.0
+    assert _milp_bound(SimpleNamespace(mip_dual_bound=-2.5, fun=5.0)) == -2.5
+    assert _milp_bound(SimpleNamespace(mip_dual_bound=None, fun=5.0)) == 5.0
+    assert _milp_bound(SimpleNamespace(mip_dual_bound=float("nan"), fun=5.0)) == 5.0
+    assert _milp_bound(SimpleNamespace(fun=5.0)) == 5.0

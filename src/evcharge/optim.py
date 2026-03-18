@@ -164,6 +164,19 @@ def _snap(values: FloatArray) -> FloatArray:
     return np.where(np.abs(values) < NUMERIC_ZERO, 0.0, values)
 
 
+def _milp_bound(res: object) -> float:
+    """Proven lower bound of a :func:`scipy.optimize.milp` result.
+
+    HiGHS reports its dual bound as ``mip_dual_bound``. A bound of exactly 0.0
+    is valid (and common), so only a missing or non-finite bound falls back to
+    the incumbent objective.
+    """
+    bound = getattr(res, "mip_dual_bound", None)
+    if bound is None or not np.isfinite(bound):
+        return float(getattr(res, "fun"))  # noqa: B009 - duck-typed result object
+    return float(bound)
+
+
 class _Model:
     """Sparse matrices of one :class:`ScheduleProblem`, reusable across solves."""
 
@@ -333,7 +346,7 @@ class _Model:
         on = x[self.n_cont :] > 0.5
         p = x[binaries]
         x[binaries] = np.where(on, np.maximum(p, self.p_min[binaries]), 0.0)
-        bound = float(getattr(res, "mip_dual_bound", None) or res.fun)
+        bound = _milp_bound(res)
         return (
             x[: self.n_cont],
             float(res.fun),
