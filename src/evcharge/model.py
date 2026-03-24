@@ -7,6 +7,15 @@ Time is discretised into equal steps (default 15 minutes).  Power is modelled as
 the *average* power over a step, which is also how settlement meters and most
 smart-charging back-ends (OCPP ``ChargingProfile`` periods) reason about it.
 
+Sites come in two electrical flavours. Without a :class:`~evcharge.electrical.Supply`
+the site is a single aggregate kW limit and sessions are commanded in kW (the
+original model). With a supply, the site is phase-aware: every line has a
+current limit and AC sessions are commanded in amperes per phase, as real
+chargers are; the kW model is the special case of one aggregate resource.
+Either way the physics compiles to linear *rows* per step,
+``sum_s a[r, s] * x[s, t] <= rhs[t, r]`` over the sessions' setpoints ``x``,
+which the simulator enforces and every policy and the optimiser respect.
+
 Every dataclass validates itself on construction and raises
 :class:`ValidationError` (a :class:`ValueError`) with an explicit message.
 """
@@ -21,6 +30,19 @@ from itertools import pairwise
 import numpy as np
 import numpy.typing as npt
 
+from evcharge.electrical import (
+    IEC_61851_MIN_CURRENT_A,
+    LINES,
+    NOMINAL_VOLTAGE_V,
+    GridType,
+    Supply,
+    Wiring,
+    WiringError,
+    balanced_line_current_a,
+    parse_rotation,
+    wiring,
+)
+
 FloatArray = npt.NDArray[np.float64]
 """One-dimensional (or two-dimensional) array of ``float64`` values."""
 
@@ -30,11 +52,14 @@ POWER_TOL_KW = 1e-6
 ENERGY_TOL_KWH = 1e-6
 """Numerical tolerance for energy comparisons (kWh)."""
 
-IEC_61851_MIN_CURRENT_A = 6.0
-"""Lowest current an AC charger may signal to the EV (IEC 61851-1 PWM, 10 % duty cycle)."""
+CURRENT_TOL_A = 1e-6
+"""Numerical tolerance for current comparisons (A)."""
 
-NOMINAL_PHASE_VOLTAGE_V = 230.0
+NOMINAL_PHASE_VOLTAGE_V = NOMINAL_VOLTAGE_V
 """Nominal phase-to-neutral voltage of a European low-voltage grid."""
+
+DEFAULT_CURRENT_STEP_A = 0.1
+"""Default setpoint resolution of an AC charger: OCPP 1.6 limits carry one decimal."""
 
 
 class ValidationError(ValueError):
@@ -157,34 +182,124 @@ class Horizon:
         return math.floor(self._offset_steps(t) + 1e-9)
 
 
+def snap_down(value: float, step: float) -> float:
+    """Largest multiple of ``step`` not above ``value`` (``value`` itself if ``step`` is 0).
+
+    Values within 1e-6 of a grid point snap to it, so solver noise such as
+    ``5.9999999`` A on a 0.1 A grid gives 6.0 A rather than 5.9 A.
+    """
+    if step <= 0:
+        return value
+    k = math.floor(value / step + 1e-6)
+    return round(k * step, 9)
+
+
+def snap_up(value: float, step: float) -> float:
+    """Smallest multiple of ``step`` not below ``value`` (``value`` itself if ``step`` is 0)."""
+    if step <= 0:
+        return value
+    k = math.ceil(value / step - 1e-6)
+    return round(k * step, 9)
+
+
+def on_grid(value: float, step: float) -> bool:
+    """Whether ``value`` is a multiple of ``step`` (always true for ``step == 0``)."""
+    if step <= 0:
+        return True
+    q = value / step
+    return abs(q - round(q)) <= 1e-6
+
+
+@dataclass(frozen=True)
+class Control:
+    """How one session is commanded: setpoint unit, range and resolution.
+
+    A setpoint ``x`` is either 0 (paused) or charging in
+    ``[charge_min, charge_max]`` on a grid of ``step``.
+
+    Attributes:
+        unit: ``"kW"`` on aggregate sites, ``"A"`` (per phase) on phase-aware sites.
+        kw_per_unit: Grid power per setpoint unit (1 for kW; for example 0.69 for a
+            three-phase EV on a 230/400 V TN grid, 0.23 for a single-phase one).
+        charge_min: Lowest non-zero setpoint (the IEC 61851 6 A minimum).
+        charge_max: Highest setpoint (charger, cable and on-board-charger limits).
+        step: Setpoint resolution; 0 means continuous.
+    """
+
+    unit: str
+    kw_per_unit: float
+    charge_min: float
+    charge_max: float
+    step: float = 0.0
+
+    def snap_down(self, value: float) -> float:
+        """Round a non-negative setpoint down to the resolution."""
+        return snap_down(value, self.step)
+
+    def snap_up(self, value: float) -> float:
+        """Round a non-negative setpoint up to the resolution."""
+        return snap_up(value, self.step)
+
+
 @dataclass(frozen=True)
 class Charger:
-    """A charge point (one connector) with its controllable power range.
+    """A charge point (one connector) with its controllable range.
+
+    The kW fields describe the charger on aggregate sites. On phase-aware sites
+    (``Site.supply`` set) the charger is commanded in amperes per phase and the
+    phase fields apply; ``max_power_kw`` then remains an additional power cap.
 
     Attributes:
         id: Unique charger identifier.
-        max_power_kw: Maximum power the charger can deliver.
-        min_power_kw: Lowest non-zero power the charger can signal. For AC
-            chargers this follows from the IEC 61851 minimum of 6 A (about
-            4.14 kW on three phases). Use 0 for continuously adjustable chargers.
+        max_power_kw: Maximum charger power.
+        min_power_kw: Lowest non-zero power the charger can signal on an
+            aggregate site. The default is the IEC 61851 minimum of 6 A for a
+            *three-phase* EV (about 4.14 kW); give single-phase EVs their own
+            ``Session.min_power_kw`` (1.38 kW) or use a phase-aware site, where
+            the minimum is a current. Use 0 for continuously adjustable chargers.
+        phases: Phases the charger provides (1 or 3; phase-aware sites only).
+        rotation: Site line of each charger conductor, e.g. ``"L2L3L1"``
+            (``None``: identity). Single-phase chargers name one line on TN and two
+            lines on IT grids, e.g. ``"L2"`` or ``"L2L3"``.
+        max_current_a: Per-phase current limit (``None``: derived from
+            ``max_power_kw``).
+        min_current_a: Lowest non-zero current (IEC 61851: 6 A).
+        current_step_a: Setpoint resolution in amperes (0 = continuous).
     """
 
     id: str
     max_power_kw: float
     min_power_kw: float = MIN_POWER_3PH_KW
+    phases: int = 3
+    rotation: str | None = None
+    max_current_a: float | None = None
+    min_current_a: float = IEC_61851_MIN_CURRENT_A
+    current_step_a: float = DEFAULT_CURRENT_STEP_A
 
     def __post_init__(self) -> None:
         if not self.id:
             raise ValidationError("charger id must be a non-empty string")
-        _require_finite(f"charger {self.id}: max_power_kw", self.max_power_kw)
-        _require_finite(f"charger {self.id}: min_power_kw", self.min_power_kw)
+        where = f"charger {self.id}"
+        _require_finite(f"{where}: max_power_kw", self.max_power_kw)
+        _require_finite(f"{where}: min_power_kw", self.min_power_kw)
         if self.max_power_kw <= 0:
-            raise ValidationError(f"charger {self.id}: max_power_kw must be > 0")
+            raise ValidationError(f"{where}: max_power_kw must be > 0")
         if not 0 <= self.min_power_kw <= self.max_power_kw:
             raise ValidationError(
-                f"charger {self.id}: min_power_kw must be in [0, max_power_kw], "
+                f"{where}: min_power_kw must be in [0, max_power_kw], "
                 f"got {self.min_power_kw} (max {self.max_power_kw})"
             )
+        if self.phases not in (1, 3):
+            raise ValidationError(f"{where}: phases must be 1 or 3, got {self.phases}")
+        if self.max_current_a is not None:
+            _require_finite(f"{where}: max_current_a", self.max_current_a)
+            if self.max_current_a <= 0:
+                raise ValidationError(f"{where}: max_current_a must be > 0")
+        for name in ("min_current_a", "current_step_a"):
+            value = float(getattr(self, name))
+            _require_finite(f"{where}: {name}", value)
+            if value < 0:
+                raise ValidationError(f"{where}: {name} must be >= 0")
 
 
 @dataclass(frozen=True)
@@ -193,12 +308,16 @@ class Site:
 
     Attributes:
         grid_limit_kw: Maximum import at the grid connection point (fuse or
-            contractual capacity), shared by base load and EV charging.
+            contractual capacity), shared by base load and EV charging. On
+            phase-aware sites it is an additional aggregate power limit.
         chargers: Charge points installed at the site.
+        supply: Phase-aware connection (grid type and per-line current limits).
+            ``None`` gives the aggregate kW model.
     """
 
     grid_limit_kw: float
     chargers: tuple[Charger, ...]
+    supply: Supply | None = None
 
     def __post_init__(self) -> None:
         _require_finite("grid_limit_kw", self.grid_limit_kw)
@@ -210,6 +329,9 @@ class Site:
         dupes = sorted({i for i in ids if ids.count(i) > 1})
         if dupes:
             raise ValidationError(f"duplicate charger ids: {', '.join(dupes)}")
+        if self.supply is not None:
+            for c in self.chargers:
+                self.charger_lines(c)
 
     def charger(self, charger_id: str) -> Charger:
         """Look up a charger by id."""
@@ -217,6 +339,20 @@ class Site:
             if c.id == charger_id:
                 return c
         raise ValidationError(f"unknown charger id {charger_id!r}")
+
+    @property
+    def phase_aware(self) -> bool:
+        """Whether the site has per-line current limits (:attr:`supply` is set)."""
+        return self.supply is not None
+
+    def charger_lines(self, charger: Charger) -> tuple[int, ...]:
+        """Site lines of the charger's conductors (phase-aware sites only)."""
+        if self.supply is None:
+            raise ValidationError("the site has no phase-aware supply")
+        try:
+            return parse_rotation(charger.rotation, charger.phases, self.supply.grid)
+        except WiringError as exc:
+            raise ValidationError(f"charger {charger.id}: {exc}") from None
 
 
 @dataclass(frozen=True)
@@ -236,6 +372,9 @@ class Session:
         min_power_kw: Optional EV-specific minimum power when charging, e.g.
             about 1.38 kW for a single-phase EV at 6 A. Defaults to the
             charger's minimum.
+        phases: Phases the on-board charger uses (1, 2 or 3; phase-aware sites).
+        max_current_a: Per-phase current limit of the on-board charger
+            (``None``: derived from ``max_power_kw``; phase-aware sites).
     """
 
     id: str
@@ -246,6 +385,8 @@ class Session:
     max_power_kw: float
     efficiency: float = 0.9
     min_power_kw: float | None = None
+    phases: int = 3
+    max_current_a: float | None = None
 
     def __post_init__(self) -> None:
         if not self.id:
@@ -270,6 +411,12 @@ class Session:
             _require_finite(f"{where}: min_power_kw", self.min_power_kw)
             if not 0 <= self.min_power_kw <= self.max_power_kw:
                 raise ValidationError(f"{where}: min_power_kw must be in [0, max_power_kw]")
+        if self.phases not in (1, 2, 3):
+            raise ValidationError(f"{where}: phases must be 1, 2 or 3, got {self.phases}")
+        if self.max_current_a is not None:
+            _require_finite(f"{where}: max_current_a", self.max_current_a)
+            if self.max_current_a <= 0:
+                raise ValidationError(f"{where}: max_current_a must be > 0")
 
     @property
     def dwell_steps(self) -> int:
@@ -334,6 +481,31 @@ class Tariff:
 
 
 @dataclass(frozen=True, eq=False)
+class RowModel:
+    """Per-step linear constraints on the setpoints of connected sessions.
+
+    Row ``r`` at step ``t`` reads ``sum_s a[r, s] * x[s, t] <= rhs[t, r]``, where
+    ``x`` are setpoints in each session's :class:`Control` unit and ``a`` comes
+    from :meth:`Scenario.row_coefficients`. On aggregate sites there is one row
+    (site import in kW). Phase-aware sites add one row per line (amperes).
+
+    Attributes:
+        names: Row names, e.g. ``"L1 import"`` or ``"site import"``.
+        kinds: ``"line"`` (amperes) or ``"site"`` (kW) for each row.
+        rhs: Right-hand sides, shape ``(n_steps, n_rows)``, never negative.
+    """
+
+    names: tuple[str, ...]
+    kinds: tuple[str, ...]
+    rhs: FloatArray
+
+    @property
+    def n_rows(self) -> int:
+        """Number of rows per step."""
+        return len(self.names)
+
+
+@dataclass(frozen=True, eq=False)
 class Scenario:
     """A complete, validated problem instance.
 
@@ -345,6 +517,10 @@ class Scenario:
         sessions: Charging sessions; sessions on the same charger must not overlap.
         base_load_kw: Non-EV site consumption per step (default: zero).
         pv_kw: On-site PV production per step (default: zero).
+        base_current_a: Non-EV load current per line, shape ``(n_steps, 3)``
+            (phase-aware sites; default: ``base_load_kw`` as a balanced load).
+        pv_current_a: PV current per line, shape ``(n_steps, 3)`` (phase-aware
+            sites; default: ``pv_kw`` as a balanced three-phase inverter).
     """
 
     name: str
@@ -354,7 +530,13 @@ class Scenario:
     sessions: tuple[Session, ...]
     base_load_kw: FloatArray | None = None
     pv_kw: FloatArray | None = None
+    base_current_a: FloatArray | None = None
+    pv_current_a: FloatArray | None = None
     _bounds: dict[str, tuple[float, float]] = field(init=False, repr=False)
+    _controls: dict[str, Control] = field(init=False, repr=False)
+    _wirings: dict[str, Wiring] = field(init=False, repr=False)
+    _by_id: dict[str, Session] = field(init=False, repr=False)
+    _rows: RowModel = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         n = self.horizon.n_steps
@@ -379,21 +561,26 @@ class Scenario:
         object.__setattr__(self, "base_load_kw", base)
         object.__setattr__(self, "pv_kw", pv)
         object.__setattr__(self, "sessions", tuple(self.sessions))
+        self._init_line_currents(base, pv)
 
         bounds: dict[str, tuple[float, float]] = {}
+        controls: dict[str, Control] = {}
+        wirings: dict[str, Wiring] = {}
         by_charger: dict[str, list[Session]] = {}
         for s in self.sessions:
             if s.id in bounds:
                 raise ValidationError(f"duplicate session id {s.id!r}")
-            charger = self.site.charger(s.charger_id)
             if s.departure_step > n:
                 raise ValidationError(
                     f"session {s.id}: departs at step {s.departure_step}, "
                     f"after the horizon end ({n})"
                 )
-            p_max = min(charger.max_power_kw, s.max_power_kw)
-            p_min = charger.min_power_kw if s.min_power_kw is None else s.min_power_kw
-            bounds[s.id] = (min(p_min, p_max), p_max)
+            control, wires = self._describe(s)
+            controls[s.id] = control
+            if wires is not None:
+                wirings[s.id] = wires
+            k = control.kw_per_unit
+            bounds[s.id] = (control.charge_min * k, control.charge_max * k)
             by_charger.setdefault(s.charger_id, []).append(s)
         for cid, sessions in by_charger.items():
             ordered = sorted(sessions, key=lambda s: s.arrival_step)
@@ -401,6 +588,93 @@ class Scenario:
                 if b.arrival_step < a.departure_step:
                     raise ValidationError(f"sessions {a.id} and {b.id} overlap on charger {cid}")
         object.__setattr__(self, "_bounds", bounds)
+        object.__setattr__(self, "_controls", controls)
+        object.__setattr__(self, "_wirings", wirings)
+        object.__setattr__(self, "_by_id", {s.id: s for s in self.sessions})
+        object.__setattr__(self, "_rows", self._build_rows())
+
+    def _init_line_currents(self, base: FloatArray, pv: FloatArray) -> None:
+        supply = self.site.supply
+        n = self.horizon.n_steps
+        if supply is None:
+            if self.base_current_a is not None or self.pv_current_a is not None:
+                raise ValidationError("per-line currents need a phase-aware site (Site.supply)")
+            return
+        for name, kw in (("base_current_a", base), ("pv_current_a", pv)):
+            raw = getattr(self, name)
+            if raw is None:
+                per_line = balanced_line_current_a(1.0, supply.grid, supply.voltage_v)
+                arr = np.repeat((kw * per_line)[:, None], 3, axis=1)
+            else:
+                arr = np.asarray(raw, dtype=np.float64)
+                if arr.shape != (n, 3):
+                    raise ValidationError(
+                        f"{name} must have shape ({n}, 3) (steps x lines), got {arr.shape}"
+                    )
+                if not np.all(np.isfinite(arr)) or np.any(arr < 0):
+                    raise ValidationError(f"{name} must be finite and >= 0")
+                arr = arr.copy()
+            arr.setflags(write=False)
+            object.__setattr__(self, name, arr)
+        limits = np.array(supply.line_limit_a)
+        b, v = self.base_line_current_a, self.pv_line_current_a
+        if supply.grid is GridType.TN:
+            imp, exp = b - v, v - b
+        else:
+            imp, exp = b, v
+        for label, load in (("import", imp), ("export", exp)):
+            over = load - limits[None, :]
+            if np.any(over > CURRENT_TOL_A):
+                t, line = np.unravel_index(int(np.argmax(over)), over.shape)
+                raise ValidationError(
+                    f"non-EV {label} current exceeds the {LINES[line]} limit at step {t} "
+                    f"({self.horizon.time_of(int(t)).isoformat()}): "
+                    f"{load[t, line]:.1f} A > {limits[line]:.1f} A"
+                )
+
+    def _describe(self, s: Session) -> tuple[Control, Wiring | None]:
+        charger = self.site.charger(s.charger_id)
+        supply = self.site.supply
+        if supply is None:
+            p_max = min(charger.max_power_kw, s.max_power_kw)
+            p_min = charger.min_power_kw if s.min_power_kw is None else s.min_power_kw
+            return Control("kW", 1.0, min(p_min, p_max), p_max), None
+        lines = self.site.charger_lines(charger)
+        try:
+            wires = wiring(supply.grid, supply.voltage_v, charger.phases, lines, s.phases)
+        except WiringError as exc:
+            raise ValidationError(f"session {s.id}: {exc}") from None
+        k = wires.kw_per_a
+        step = charger.current_step_a
+        caps = [charger.max_power_kw / k, s.max_power_kw / k]
+        caps += [c for c in (charger.max_current_a, s.max_current_a) if c is not None]
+        i_max = snap_down(min(caps), step)
+        i_min = charger.min_current_a
+        if s.min_power_kw is not None:
+            i_min = max(i_min, s.min_power_kw / k)
+        i_min = snap_up(i_min, step)
+        if i_max <= 0 or i_min > i_max + CURRENT_TOL_A:
+            raise ValidationError(
+                f"session {s.id}: the EV cannot charge at the {i_min:g} A minimum "
+                f"(at most {i_max:g} A on {wires.phases} phase(s))"
+            )
+        return Control("A", k, i_min, i_max, step), wires
+
+    def _build_rows(self) -> RowModel:
+        site_import = np.maximum(0.0, self.site.grid_limit_kw - self.net_base_kw)
+        supply = self.site.supply
+        if supply is None:
+            return RowModel(("site import",), ("site",), _frozen(site_import[:, None]))
+        kappa = 1.0 if supply.grid is GridType.TN else 0.0
+        limits = np.array(supply.line_limit_a)
+        line_import = np.maximum(
+            0.0, limits[None, :] - self.base_line_current_a + kappa * self.pv_line_current_a
+        )
+        return RowModel(
+            (*(f"{line} import" for line in LINES), "site import"),
+            ("line", "line", "line", "site"),
+            _frozen(np.column_stack([line_import, site_import])),
+        )
 
     @property
     def base_load(self) -> FloatArray:
@@ -424,17 +698,92 @@ class Scenario:
         """Power available for EV charging per step: grid limit - base load + PV."""
         return np.asarray(self.site.grid_limit_kw - self.net_base_kw, dtype=np.float64)
 
+    @property
+    def base_line_current_a(self) -> FloatArray:
+        """Non-EV load current per line, shape ``(n_steps, 3)`` (phase-aware sites)."""
+        if self.base_current_a is None:
+            raise ValidationError("the site has no phase-aware supply")
+        return self.base_current_a
+
+    @property
+    def pv_line_current_a(self) -> FloatArray:
+        """PV current per line, shape ``(n_steps, 3)`` (phase-aware sites)."""
+        if self.pv_current_a is None:
+            raise ValidationError("the site has no phase-aware supply")
+        return self.pv_current_a
+
+    @property
+    def rows(self) -> RowModel:
+        """Per-step constraint rows of the site (see :class:`RowModel`)."""
+        return self._rows
+
+    def _is_own(self, session: Session) -> bool:
+        return self._by_id.get(session.id) == session
+
+    def control(self, session: Session) -> Control:
+        """Setpoint unit, range and resolution of a session (see :class:`Control`).
+
+        Works for any session whose charger is on this site, for example a
+        forecast EV that has not arrived.
+        """
+        if self._is_own(session):
+            return self._controls[session.id]
+        return self._describe(session)[0]
+
+    def wiring(self, session: Session) -> Wiring | None:
+        """How the session loads the site lines (``None`` on aggregate sites)."""
+        if self._is_own(session):
+            return self._wirings.get(session.id)
+        return self._describe(session)[1]
+
+    def row_coefficients(self, session: Session) -> FloatArray:
+        """Coefficient of the session's setpoint in every row of :attr:`rows`."""
+        wires = self.wiring(session)
+        if wires is None:
+            return np.ones(1)
+        return np.array([*wires.incidence(), wires.kw_per_a])
+
     def power_bounds(self, session: Session) -> tuple[float, float]:
         """Return ``(p_min, p_max)`` in kW for a session of this scenario.
 
         ``p_max`` is the lower of charger and EV limits. ``p_min`` is the lowest
         non-zero power that can be signalled (EV override or charger minimum,
         never above ``p_max``). A session charges at 0 or within ``[p_min, p_max]``.
+        On phase-aware sites these are the current limits times
+        :attr:`Control.kw_per_unit`.
         """
         try:
             return self._bounds[session.id]
         except KeyError:
             raise ValidationError(f"session {session.id!r} is not part of this scenario") from None
+
+    def line_currents_a(self, setpoint: FloatArray) -> FloatArray:
+        """Modelled current on every line for a setpoint matrix.
+
+        Args:
+            setpoint: Setpoints in control units, shape ``(n_sessions, n_steps)``.
+
+        Returns:
+            Shape ``(n_steps, 3)``: on TN grids the magnitude of the signed sum of
+            base load, PV and EV currents (exact for in-phase currents); on IT
+            grids the load current (PV gets no credit, see ``docs/theory.md``).
+        """
+        supply = self.site.supply
+        if supply is None:
+            raise ValidationError("line currents need a phase-aware site (Site.supply)")
+        x = np.asarray(setpoint, dtype=np.float64)
+        if x.shape != (len(self.sessions), self.horizon.n_steps):
+            raise ValidationError(
+                f"setpoint must have shape ({len(self.sessions)}, {self.horizon.n_steps})"
+            )
+        incidence = np.array([self._wirings[s.id].incidence() for s in self.sessions]).reshape(
+            len(self.sessions), 3
+        )
+        ev = x.T @ incidence
+        base, pv = self.base_line_current_a, self.pv_line_current_a
+        if supply.grid is GridType.TN:
+            return np.asarray(np.abs(base - pv + ev), dtype=np.float64)
+        return np.asarray(base + ev, dtype=np.float64)
 
     @property
     def energy_requested_kwh(self) -> float:
@@ -443,12 +792,24 @@ class Scenario:
 
     def without_sessions(self) -> Scenario:
         """Copy of the scenario with sessions removed (what an online policy may know)."""
+        return self.with_sessions(())
+
+    def with_sessions(self, sessions: tuple[Session, ...]) -> Scenario:
+        """Copy of the scenario with a different set of sessions."""
         return Scenario(
             name=self.name,
             horizon=self.horizon,
             site=self.site,
             tariff=self.tariff,
-            sessions=(),
+            sessions=sessions,
             base_load_kw=self.base_load,
             pv_kw=self.pv,
+            base_current_a=self.base_current_a if self.site.phase_aware else None,
+            pv_current_a=self.pv_current_a if self.site.phase_aware else None,
         )
+
+
+def _frozen(values: FloatArray) -> FloatArray:
+    out = np.ascontiguousarray(values, dtype=np.float64)
+    out.setflags(write=False)
+    return out

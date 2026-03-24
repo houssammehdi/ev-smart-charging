@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 import numpy as np
 import pytest
 
+from evcharge.electrical import Supply
 from evcharge.model import (
     MIN_POWER_1PH_KW,
     MIN_POWER_3PH_KW,
@@ -158,3 +159,126 @@ def test_back_to_back_sessions_are_allowed_and_headroom() -> None:
     assert sc.without_sessions().sessions == ()
     # base load above the limit is fine when PV covers it
     make_scenario([], grid_limit_kw=10.0, base_load=[12, 0, 0, 0], pv=[3, 0, 0, 0])
+
+
+def phase_site(grid: str = "TN", *, limit_a: float = 32.0, chargers: list[Charger]) -> Site:
+    return Site(100.0, tuple(chargers), supply=Supply.uniform(limit_a, grid=grid))
+
+
+def test_phase_aware_controls_are_in_amperes() -> None:
+    site = phase_site(
+        chargers=[
+            Charger("C1", 22.0, max_current_a=32.0),
+            Charger("C2", 11.0, rotation="L2L3L1"),
+            Charger("C3", 7.4, phases=1, rotation="L3", current_step_a=1.0),
+        ]
+    )
+    sc = make_scenario(
+        [
+            Session("A", "C1", 0, 2, 5.0, 11.0, max_current_a=16.0),  # 3-phase 16 A EV
+            Session("B", "C2", 0, 2, 5.0, 7.4, phases=1, max_current_a=32.0),
+            Session("C", "C3", 0, 2, 5.0, 11.0, phases=3),
+        ],
+        chargers=list(site.chargers),
+        supply=site.supply,
+    )
+    a, b, c = sc.sessions
+    ca = sc.control(a)
+    # every limit applies: 16 A x 3 x 230 V = 11.04 kW, so the declared 11.0 kW binds
+    # first (15.94 A), rounded down to the 0.1 A resolution
+    assert (ca.unit, ca.charge_min, ca.charge_max, ca.step) == ("A", 6.0, 15.9, 0.1)
+    assert ca.kw_per_unit == pytest.approx(0.69)
+    assert sc.power_bounds(a) == pytest.approx((4.14, 15.9 * 0.69))
+    # 11 kW charger on one phase: the power cap binds at 11 / 0.23 = 47.8 A, the
+    # EV's 7.4 kW at 32.17 A and its 32 A current limit below that
+    cb = sc.control(b)
+    assert cb.charge_max == pytest.approx(32.0)
+    wb = sc.wiring(b)
+    assert wb is not None
+    assert wb.lines == (1,)
+    # 7.4 kW single-phase charger on L3 with 1 A resolution: floor(7400 / 230) = 32 A
+    cc = sc.control(c)
+    assert (cc.charge_min, cc.charge_max, cc.step) == (6.0, 32.0, 1.0)
+    assert sc.row_coefficients(c).tolist() == pytest.approx([0.0, 0.0, 1.0, 0.23])
+    assert sc.rows.names == ("L1 import", "L2 import", "L3 import", "site import")
+    assert sc.rows.kinds == ("line", "line", "line", "site")
+
+
+def test_phase_minimum_is_a_current_not_a_power() -> None:
+    # The aggregate model turns a 3.7 kW single-phase EV on a default charger into
+    # an on/off 3.7 kW load; with phases the minimum is 6 A on one phase (1.38 kW).
+    sessions = [Session("A", "C1", 0, 2, 2.0, 3.7)]
+    assert make_scenario(sessions, charger_min_kw=4.14).power_bounds(sessions[0]) == (3.7, 3.7)
+    one_phase = [Session("A", "C1", 0, 2, 2.0, 3.7, phases=1)]
+    sc = make_scenario(one_phase, chargers=[Charger("C1", 11.0)], supply=Supply.uniform(25.0))
+    assert sc.power_bounds(one_phase[0]) == pytest.approx((1.38, 3.68))
+    with pytest.raises(ValidationError, match="cannot charge at the 6 A minimum"):
+        make_scenario(sessions, chargers=[Charger("C1", 11.0)], supply=Supply.uniform(25.0))
+
+
+def test_phase_rows_and_line_currents() -> None:
+    chargers = [Charger("C1", 11.0), Charger("C2", 11.0, rotation="L2L3L1")]
+    sessions = [
+        Session("A", "C1", 0, 2, 5.0, 3.7, phases=1),
+        Session("B", "C2", 0, 2, 5.0, 11.0),
+    ]
+    base = np.array([[10.0, 0.0, 5.0], [10.0, 0.0, 5.0]])
+    pv = np.array([[0.0, 0.0, 0.0], [8.0, 8.0, 8.0]])
+    tn = make_scenario(
+        sessions,
+        n_steps=2,
+        chargers=chargers,
+        supply=Supply.uniform(32.0),
+        base_current_a=base,
+        pv_current_a=pv,
+    )
+    # TN: PV current is credited (collinear, unity power factor)
+    np.testing.assert_allclose(tn.rows.rhs[:, :3], [[22.0, 32.0, 27.0], [30.0, 40.0, 35.0]])
+    x = np.array([[10.0, 16.0], [6.0, 6.0]])  # A on L1 (1-phase); B 3-phase
+    np.testing.assert_allclose(tn.line_currents_a(x), [[26.0, 6.0, 11.0], [24.0, 2.0, 3.0]])
+    it = make_scenario(
+        sessions,
+        n_steps=2,
+        chargers=chargers,
+        supply=Supply.uniform(32.0, grid="IT"),
+        base_current_a=base,
+        pv_current_a=pv,
+    )
+    # IT: no PV credit, and the single-phase EV loads L1 and L2
+    np.testing.assert_allclose(it.rows.rhs[:, :3], [[22.0, 32.0, 27.0], [22.0, 32.0, 27.0]])
+    assert it.row_coefficients(it.sessions[0]).tolist()[:3] == [1.0, 1.0, 0.0]
+    np.testing.assert_allclose(it.line_currents_a(x), [[26.0, 16.0, 11.0], [32.0, 22.0, 11.0]])
+
+
+def test_phase_validation() -> None:
+    chargers = [Charger("C1", 11.0)]
+    with pytest.raises(ValidationError, match="L2 limit at step 1"):
+        make_scenario(
+            [],
+            n_steps=2,
+            chargers=chargers,
+            supply=Supply.uniform(16.0),
+            base_current_a=np.array([[1.0, 1.0, 1.0], [1.0, 17.0, 1.0]]),
+        )
+    with pytest.raises(ValidationError, match="shape"):
+        make_scenario([], chargers=chargers, supply=Supply.uniform(16.0), base_current_a=[1.0])
+    with pytest.raises(ValidationError, match="phase-aware"):
+        make_scenario([], chargers=chargers, base_current_a=np.zeros((4, 3)))
+    with pytest.raises(ValidationError, match="two-phase"):
+        make_scenario(
+            [Session("A", "C1", 0, 2, 5.0, 11.0, phases=2)],
+            chargers=chargers,
+            supply=Supply.uniform(32.0, grid="IT"),
+        )
+    with pytest.raises(ValidationError, match="charger C1: a single-phase IT charger"):
+        Site(10.0, (Charger("C1", 7.4, phases=1, rotation="L1"),), Supply.uniform(32, "IT"))
+    with pytest.raises(ValidationError, match="phases must be 1 or 3"):
+        Charger("C1", 11.0, phases=2)
+    with pytest.raises(ValidationError, match="phases must be 1, 2 or 3"):
+        Session("A", "C1", 0, 2, 5.0, 11.0, phases=4)
+    with pytest.raises(ValidationError, match="line currents need"):
+        make_scenario([session("A", "C1", 0, 2, 5.0)]).line_currents_a(np.zeros((1, 4)))
+    # balanced default: 6.9 kW of base load is 10 A per line on TN
+    sc = make_scenario([], chargers=chargers, supply=Supply.uniform(16.0), base_load=[6.9] * 4)
+    np.testing.assert_allclose(sc.base_line_current_a, 10.0)
+    assert sc.without_sessions().base_current_a is not None

@@ -7,6 +7,7 @@ from datetime import datetime
 
 import numpy as np
 
+from evcharge.electrical import Supply
 from evcharge.model import Charger, Horizon, Scenario, Session, Site, Tariff
 
 START = datetime(2026, 1, 5, 0, 0)
@@ -26,6 +27,9 @@ def make_scenario(
     chargers: Sequence[Charger] | None = None,
     charger_kw: float = 11.0,
     charger_min_kw: float = 0.0,
+    supply: Supply | None = None,
+    base_current_a: object = None,
+    pv_current_a: object = None,
 ) -> Scenario:
     """Build a scenario; by default one charger per referenced charger id."""
     if chargers is None:
@@ -34,7 +38,7 @@ def make_scenario(
     return Scenario(
         name="test",
         horizon=Horizon(START, n_steps, step_minutes),
-        site=Site(grid_limit_kw, tuple(chargers)),
+        site=Site(grid_limit_kw, tuple(chargers), supply),
         tariff=Tariff(
             np.asarray(prices if prices is not None else [0.1] * n_steps, dtype=float),
             None if export_prices is None else np.asarray(export_prices, dtype=float),
@@ -43,6 +47,8 @@ def make_scenario(
         sessions=tuple(sessions),
         base_load_kw=None if base_load is None else np.asarray(base_load, dtype=float),
         pv_kw=None if pv is None else np.asarray(pv, dtype=float),
+        base_current_a=None if base_current_a is None else np.asarray(base_current_a, dtype=float),
+        pv_current_a=None if pv_current_a is None else np.asarray(pv_current_a, dtype=float),
     )
 
 
