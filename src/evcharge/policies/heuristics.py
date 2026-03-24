@@ -1,14 +1,18 @@
 """Real-time heuristic policies (no optimisation solver, O(n log n) per step).
 
-All heuristics share two rules that real load-management controllers follow:
+All heuristics share the rules that real load-management controllers follow:
 
-* the sum of commands never exceeds the site headroom (grid limit - base load + PV);
-* a session is either paused (0 kW) or charged at no less than its minimum
-  power (IEC 61851: 6 A), so heuristics decide *who* charges before *how much*.
+* commands never exceed the step's capacity rows: the site headroom (grid
+  limit - base load + PV) and, on phase-aware sites, every line's current
+  limit, so a line is never overloaded even when many single-phase EVs share it;
+* a session is either paused or charged at no less than its minimum (IEC
+  61851: 6 A), so heuristics decide *who* charges before *how much*;
+* setpoints are multiples of the charger's resolution.
 """
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 
 import numpy as np
@@ -20,8 +24,8 @@ from evcharge.policies.base import (
     SessionState,
     Setpoints,
     command_bounds,
+    fair_fill,
     priority_fill,
-    water_fill,
 )
 
 
@@ -29,8 +33,9 @@ class Uncontrolled(OnlinePolicy):
     """Plug-and-charge baseline: every EV charges at full power as soon as it arrives.
 
     The only control is the protection a static load balancer provides: when
-    the site limit is reached, EVs that plugged in earlier keep full power and
-    later arrivals get what is left (first come, first served).
+    the site limit (or a line limit) is reached, EVs that plugged in earlier
+    keep full power and later arrivals get what is left (first come, first
+    served).
     """
 
     name = "uncontrolled"
@@ -38,47 +43,49 @@ class Uncontrolled(OnlinePolicy):
     def decide(self, obs: Observation) -> Mapping[str, float]:
         """Serve sessions in plug-in order at maximum power."""
         order = sorted(obs.pending(), key=lambda s: (s.session.arrival_step, s.id))
-        return priority_fill(order, obs.headroom_kw)
+        return priority_fill(order, obs.allocation())
 
 
 class EqualShare(OnlinePolicy):
-    """Split the headroom equally between connected EVs (water-filling).
+    """Split the capacity equally between connected EVs (water-filling).
 
     EVs that need less than the equal share keep only what they can use and the
-    rest is redistributed. When the headroom cannot give every EV its minimum
-    power, the least-served EVs (lowest delivered fraction) are admitted first,
-    which rotates access over time.
+    rest is redistributed. On phase-aware sites the split is max-min fair over
+    all lines: EVs on a saturated line stop rising while the others continue.
+    When the capacity cannot give every EV its minimum, the least-served EVs
+    (lowest delivered fraction) are admitted first, which rotates access over
+    time.
     """
 
     name = "equal-share"
 
     def decide(self, obs: Observation) -> Mapping[str, float]:
-        """Water-fill the headroom over the largest admissible set of EVs."""
+        """Water-fill the capacity over the largest admissible set of EVs."""
         pending = sorted(
             obs.pending(),
             key=lambda s: (s.delivered_fraction, s.session.departure_step, s.id),
         )
         bounds = [command_bounds(s) for s in pending]
-        budget = max(0.0, obs.headroom_kw)
+        alloc = obs.allocation()
         # Admission is monotone: adding an EV can only lower the water level.
         admitted = len(pending)
+        levels: list[float] = []
         while admitted > 0:
             caps = [b[1] for b in bounds[:admitted]]
-            alloc = water_fill(caps, budget)
-            if all(a + 1e-9 >= b[0] and a > 0 for a, b in zip(alloc, bounds, strict=False)):
+            levels = fair_fill(pending[:admitted], caps, alloc)
+            if all(a + 1e-9 >= b[0] and a > 0 for a, b in zip(levels, bounds, strict=False)):
                 break
             admitted -= 1
         out: Setpoints = {}
-        if admitted > 0:
-            caps = [b[1] for b in bounds[:admitted]]
-            for st, a in zip(pending, water_fill(caps, budget), strict=False):
-                out[st.id] = a
-        left = budget - sum(out.values())
+        for st, a in zip(pending[:admitted], levels, strict=False):
+            out[st.id] = a
+            alloc.take(st.id, a)
         for st, (lowest, useful) in zip(pending[admitted:], bounds[admitted:], strict=True):
-            if left + 1e-9 >= max(lowest, 1e-9):
-                cmd = min(useful, left)
+            room = st.control.snap_down(alloc.headroom(st.id))
+            if room + 1e-9 >= max(lowest, 1e-9):
+                cmd = min(useful, room)
                 out[st.id] = cmd
-                left -= cmd
+                alloc.take(st.id, cmd)
         return out
 
 
@@ -93,7 +100,7 @@ class EarliestDeadlineFirst(OnlinePolicy):
             obs.pending(),
             key=lambda s: (s.session.departure_step, s.session.arrival_step, s.id),
         )
-        return priority_fill(order, obs.headroom_kw)
+        return priority_fill(order, obs.allocation())
 
 
 class LeastLaxityFirst(OnlinePolicy):
@@ -104,18 +111,19 @@ class LeastLaxityFirst(OnlinePolicy):
     def decide(self, obs: Observation) -> Mapping[str, float]:
         """Serve sessions in order of laxity."""
         order = sorted(obs.pending(), key=lambda s: (s.laxity_h, s.session.departure_step, s.id))
-        return priority_fill(order, obs.headroom_kw)
+        return priority_fill(order, obs.allocation())
 
 
 class PriceAware(OnlinePolicy):
     """Greedy valley filling: EVs book the cheapest free capacity in their window.
 
     At every step the plan is rebuilt from scratch: connected EVs, taken in
-    least-laxity order, each reserve power in the cheapest steps before their
-    departure, using only the forecast headroom not already reserved by EVs
-    earlier in the order (ties go to the earlier step). Steps with PV surplus
-    are valued at the export price, since charging then only costs the forgone
-    feed-in. The reservations of the current step are executed.
+    least-laxity order, each reserve setpoints in the cheapest steps before
+    their departure, using only the forecast capacity (on every row they load)
+    not already reserved by EVs earlier in the order (ties go to the earlier
+    step). Steps with PV surplus are valued at the export price, since charging
+    then only costs the forgone feed-in. The reservations of the current step
+    are executed.
 
     Each EV is planned once per step against the bookings of the EVs before it,
     so the greedy never trades slots between EVs and cannot anticipate EVs
@@ -138,28 +146,33 @@ class PriceAware(OnlinePolicy):
         )
 
     @staticmethod
-    def _book(st: SessionState, price: FloatArray, free: FloatArray) -> float:
-        """Reserve capacity for ``st`` in ``free`` (updated in place); return the first step."""
-        booking = np.zeros(st.steps_left)
-        energy_per_kw = st.session.efficiency * st.dt_h
+    def _book(st: SessionState, coef: FloatArray, price: FloatArray, slack: FloatArray) -> float:
+        """Reserve capacity for ``st`` in ``slack`` (updated in place); return step 0's booking."""
+        ctl = st.control
+        energy_per_unit = st.session.efficiency * ctl.kw_per_unit * st.dt_h
         deficit = st.remaining_kwh
+        pos = coef > 0
+        now = 0.0
         for offset in np.argsort(price[: st.steps_left], kind="stable"):
             k = int(offset)
-            add = min(st.p_max_kw, free[k], deficit / energy_per_kw)
-            if add < st.p_min_kw:
-                # Too little for the minimum current: book p_min if it fits
+            room = float(np.min(slack[k, pos] / coef[pos])) if pos.any() else math.inf
+            room = ctl.snap_down(max(0.0, room))
+            add = min(ctl.charge_max, room, ctl.snap_up(deficit / energy_per_unit))
+            if add < ctl.charge_min:
+                # Too little for the minimum current: book the minimum if it fits
                 # (the EV stops by itself once full), otherwise skip the step.
-                if free[k] + 1e-9 < st.p_min_kw:
+                if room + 1e-9 < ctl.charge_min:
                     continue
-                add = st.p_min_kw
+                add = ctl.charge_min
             if add <= 1e-9:
                 continue
-            booking[k] = add
-            free[k] -= add
-            deficit -= add * energy_per_kw
+            if k == 0:
+                now = add
+            slack[k] -= coef * add
+            deficit -= add * energy_per_unit
             if deficit <= 1e-9:
                 break
-        return float(booking[0])
+        return now
 
     def decide(self, obs: Observation) -> Mapping[str, float]:
         """Rebuild the reservation plan and return its first step."""
@@ -167,11 +180,12 @@ class PriceAware(OnlinePolicy):
         if not pending:
             return {}
         horizon = max(st.steps_left for st in pending)
-        free = self.scenario.ev_headroom_kw[obs.step : obs.step + horizon].copy()
+        slack = np.array(self.scenario.rows.rhs[obs.step : obs.step + horizon], dtype=np.float64)
         price = self._price[obs.step : obs.step + horizon]
+        rows = obs.rows
         out: Setpoints = {}
         for st in pending:
-            now = self._book(st, price, free)
+            now = self._book(st, rows.coefficient(st.id), price, slack)
             if now > 0.0:
                 out[st.id] = now
         return out

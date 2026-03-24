@@ -3,7 +3,9 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from evcharge.electrical import Supply
 from evcharge.metrics import compute_metrics
+from evcharge.model import Charger, Session
 from evcharge.policies import (
     POLICY_FACTORIES,
     EarliestDeadlineFirst,
@@ -243,3 +245,59 @@ def test_registry() -> None:
         _ = Uncontrolled().scenario
     with pytest.raises(RuntimeError):
         _ = OptimalSchedule().solution
+
+
+def test_phase_aware_heuristics_never_overload_a_line() -> None:
+    # Three single-phase EVs on L1 and one three-phase EV, 20 A fuse per line.
+    chargers = [Charger(f"C{i}", 7.4, phases=1, rotation="L1") for i in range(3)]
+    chargers.append(Charger("C3", 11.0))
+    sessions = [Session(f"S{i}", f"C{i}", 0, 4, 30.0, 7.4, phases=1) for i in range(3)]
+    sessions.append(Session("S3", "C3", 0, 4, 30.0, 11.0))
+    sc = make_scenario(sessions, chargers=chargers, supply=Supply.uniform(20.0))
+    for policy in (Uncontrolled(), EqualShare(), EarliestDeadlineFirst(), LeastLaxityFirst()):
+        res = simulate(sc, policy)
+        assert res.violations == (), policy
+        assert res.line_current_a is not None
+        assert res.line_current_a.max() <= 20.0 + 1e-9, policy
+    # FCFS: S0 (earliest id, a 32 A EV) takes all 20 A of L1. Nothing is left on L1,
+    # so the other single-phase EVs wait and the three-phase EV cannot start either,
+    # although L2 and L3 are idle: the imbalance a kW-only limit would not see.
+    first = simulate(sc, Uncontrolled())
+    assert first.setpoint is not None
+    np.testing.assert_allclose(first.setpoint[:, 0], [20.0, 0.0, 0.0, 0.0])
+
+
+def test_equal_share_is_max_min_fair_across_lines() -> None:
+    chargers = [
+        Charger("A", 7.4, phases=1, rotation="L1"),
+        Charger("B", 7.4, phases=1, rotation="L1"),
+        Charger("C", 7.4, phases=1, rotation="L2"),
+    ]
+    sessions = [Session(c.id, c.id, 0, 4, 40.0, 7.4, phases=1) for c in chargers]
+    sc = make_scenario(sessions, chargers=chargers, supply=Supply.uniform(20.0))
+    res = simulate(sc, EqualShare())
+    assert res.setpoint is not None
+    # A and B share L1 (10 A each); C is alone on L2 and gets its 32 A cap limited by 20 A
+    np.testing.assert_allclose(res.setpoint[:, 0], [10.0, 10.0, 20.0])
+    assert res.violations == ()
+
+
+def test_price_aware_books_line_capacity() -> None:
+    chargers = [Charger("A", 7.4, phases=1, rotation="L1"), Charger("B", 7.4, phases=1)]
+    sessions = [
+        Session("A", "A", 0, 4, 7.36, 7.4, phases=1, efficiency=1.0),
+        Session("B", "B", 0, 2, 3.68, 7.4, phases=1, efficiency=1.0),
+    ]
+    sc = make_scenario(
+        sessions,
+        chargers=chargers,
+        supply=Supply.uniform(16.0),
+        prices=[0.3, 0.1, 0.2, 0.4],
+    )
+    res = simulate(sc, PriceAware())
+    assert res.setpoint is not None
+    # Both EVs are on L1. B (less laxity) books its cheaper step (1) at 16 A = 3.68 kWh;
+    # A then takes the cheapest steps L1 still has free: 2 (0.2) and 0 (0.3)
+    np.testing.assert_allclose(res.setpoint[1], [0.0, 16.0, 0.0, 0.0])
+    np.testing.assert_allclose(res.setpoint[0], [16.0, 0.0, 16.0, 0.0])
+    assert res.violations == ()

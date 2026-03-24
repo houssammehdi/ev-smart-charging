@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 
 import numpy as np
 import pytest
 
-from evcharge.model import Scenario
+from evcharge.electrical import Supply
+from evcharge.model import Charger, Scenario, Session
 from evcharge.policies import OnlinePolicy, OptimalSchedule, Uncontrolled
 from evcharge.policies.base import Observation
 from evcharge.sim import ViolationKind, simulate
@@ -138,3 +140,52 @@ def test_export_and_import_split() -> None:
     np.testing.assert_allclose(res.export_kw, [0.0, 4.0, 0.0, 0.0])
     np.testing.assert_allclose(res.ev_power_kw, [2.0, 0.0, 0.0, 0.0])
     np.testing.assert_allclose(res.unmet_kwh, [0.0])
+
+
+def one_phase_site(limit_a: float = 20.0, step_a: float = 0.1) -> dict[str, object]:
+    chargers = [
+        Charger("C1", 7.4, phases=1, rotation="L1", current_step_a=step_a),
+        Charger("C2", 7.4, phases=1, rotation="L1", current_step_a=step_a),
+        Charger("C3", 22.0, current_step_a=step_a),
+    ]
+    return {"chargers": chargers, "supply": Supply.uniform(limit_a), "grid_limit_kw": 100.0}
+
+
+def test_line_limit_is_enforced_in_amperes() -> None:
+    sessions = [
+        Session("A", "C1", 0, 2, 20.0, 7.4, phases=1),
+        Session("B", "C2", 0, 2, 20.0, 7.4, phases=1),
+        Session("C", "C3", 0, 2, 20.0, 11.0),
+    ]
+    sc = make_scenario(sessions, n_steps=2, **one_phase_site())  # type: ignore[arg-type]
+    res = simulate(sc, Scripted({0: {"A": 16.0, "B": 16.0, "C": 10.0}, 1: {"A": 12.34}}))
+    kinds = [(v.step, v.kind, v.unit) for v in res.violations]
+    assert kinds == [
+        (0, ViolationKind.LINE_LIMIT, "A"),
+        (1, ViolationKind.RESOLUTION, "A"),
+    ]
+    over = res.violations[0]
+    # L1 carries A + B + C = 42 A against 20 A: A and B shrink, C (on all lines) too
+    assert over.requested == pytest.approx(42.0)
+    assert over.applied == pytest.approx(20.0)
+    assert math.isnan(over.requested_kw)
+    assert res.line_current_a is not None
+    assert res.line_current_a[0, 0] <= 20.0 + 1e-9
+    assert res.setpoint is not None
+    np.testing.assert_allclose(res.setpoint[:, 1], [12.3, 0.0, 0.0])
+    np.testing.assert_allclose(res.setpoint_kw[0, 1], 12.3 * 0.23)
+    # every applied setpoint is on the 0.1 A grid
+    assert np.allclose(res.setpoint * 10, np.round(res.setpoint * 10))
+
+
+def test_phase_aware_physics_and_line_currents() -> None:
+    sessions = [Session("A", "C1", 0, 2, 1.0, 7.4, phases=1, efficiency=1.0)]
+    sc = make_scenario(sessions, n_steps=2, **one_phase_site())  # type: ignore[arg-type]
+    res = simulate(sc, Scripted({0: {"A": 16.0}, 1: {"A": 16.0}}))
+    # 16 A x 230 V = 3.68 kW for up to an hour; the EV stops after 1 kWh, and the
+    # command of step 1 is recorded although the full EV draws nothing
+    np.testing.assert_allclose(res.setpoint_kw[0], [3.68, 3.68])
+    np.testing.assert_allclose(res.power_kw[0], [1.0, 0.0])
+    assert res.line_current_a is not None
+    np.testing.assert_allclose(res.line_current_a, [[16.0, 0.0, 0.0], [0.0, 0.0, 0.0]])
+    assert res.violations == ()

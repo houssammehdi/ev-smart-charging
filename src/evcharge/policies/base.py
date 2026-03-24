@@ -1,23 +1,35 @@
 """Policy protocol, observations and shared allocation helpers.
 
 A policy is called once per time step with an :class:`Observation` of the
-currently connected EVs and returns a power setpoint (kW) per session id.
-Setpoints are *commands*: the simulator treats a non-zero setpoint below the
-session's minimum power as a violation, and an EV stops drawing power as soon as
-its requested energy is reached, so commanding ``p_min`` to finish the last few
-hundred Wh is legitimate and physically accurate.
+currently connected EVs and returns a setpoint per session id, in the
+session's control unit (:attr:`SessionState.control`): kW on aggregate sites,
+amperes per phase on phase-aware sites. Setpoints are *commands*: the
+simulator treats a non-zero setpoint below the session's minimum as a
+violation, and an EV stops drawing power as soon as its requested energy is
+reached, so commanding the minimum to finish the last few hundred Wh is
+legitimate and physically accurate.
+
+Capacity is described by :attr:`Observation.constraints`, the linear rows of
+the step (one kW row on aggregate sites, plus one row per line on phase-aware
+sites). The helpers below allocate against those rows, so every built-in
+heuristic is phase-aware without special cases, and on one kW row they reduce
+exactly to the original single-headroom arithmetic.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from functools import cached_property
 from typing import Protocol, runtime_checkable
 
-from evcharge.model import ENERGY_TOL_KWH, POWER_TOL_KW, Scenario, Session
+import numpy as np
+
+from evcharge.capacity import ROW_TOL, Allocation, StepConstraints, fit_to_rows
+from evcharge.model import ENERGY_TOL_KWH, POWER_TOL_KW, Control, Scenario, Session
 
 Setpoints = dict[str, float]
-"""Mapping of session id to commanded power in kW."""
+"""Mapping of session id to its setpoint (kW, or A per phase on phase-aware sites)."""
 
 
 @dataclass(frozen=True)
@@ -31,6 +43,8 @@ class SessionState:
         p_max_kw: Highest power that can be commanded.
         steps_left: Steps until departure, including the current one.
         dt_h: Step length in hours.
+        control_spec: How the session is commanded; ``None`` means kW setpoints
+            in ``[p_min_kw, p_max_kw]`` (the aggregate model).
     """
 
     session: Session
@@ -39,6 +53,14 @@ class SessionState:
     p_max_kw: float
     steps_left: int
     dt_h: float
+    control_spec: Control | None = None
+
+    @cached_property
+    def control(self) -> Control:
+        """Setpoint unit, range and resolution of the session."""
+        if self.control_spec is not None:
+            return self.control_spec
+        return Control("kW", 1.0, self.p_min_kw, self.p_max_kw)
 
     @property
     def id(self) -> str:
@@ -87,16 +109,30 @@ class Observation:
         headroom_kw: Power available for EV charging this step
             (grid limit - base load + PV).
         peak_import_kw: Highest site import observed in earlier steps (>= 0).
+        constraints: Linear rows the setpoints must satisfy this step. ``None``
+            means the single aggregate row ``sum of kW setpoints <= headroom_kw``.
     """
 
     step: int
     sessions: tuple[SessionState, ...]
     headroom_kw: float
     peak_import_kw: float
+    constraints: StepConstraints | None = None
 
     def pending(self) -> list[SessionState]:
         """Return the connected sessions that still need energy."""
         return [s for s in self.sessions if not s.is_satisfied]
+
+    @property
+    def rows(self) -> StepConstraints:
+        """The step's constraint rows (the aggregate kW row if none were given)."""
+        if self.constraints is not None:
+            return self.constraints
+        return StepConstraints.single(self.headroom_kw)
+
+    def allocation(self) -> Allocation:
+        """Fresh :class:`Allocation` over this step's rows."""
+        return Allocation(self.rows)
 
 
 @runtime_checkable
@@ -124,7 +160,7 @@ class Policy(Protocol):
         ...
 
     def decide(self, obs: Observation) -> Mapping[str, float]:
-        """Return power setpoints (kW) for connected sessions; omitted ids get 0."""
+        """Return setpoints for connected sessions (their control unit); omitted ids get 0."""
         ...
 
 
@@ -157,36 +193,43 @@ class OnlinePolicy:
 
 
 def command_bounds(state: SessionState) -> tuple[float, float]:
-    """Return ``(lowest, useful)`` command for a session that should charge now.
+    """Return ``(lowest, useful)`` setpoint for a session that should charge now.
 
-    ``useful`` is the power that is actually useful (``desired_kw``), raised to
-    ``p_min`` when finishing requires less than the minimum; the EV stops by
-    itself once full, so the surplus is never drawn.
+    ``useful`` is the setpoint that finishes the request this step (rounded up
+    to the resolution) or the maximum, raised to the minimum when finishing
+    needs less; the EV stops by itself once full, so the surplus is never drawn.
     """
-    useful = max(state.desired_kw, state.p_min_kw)
-    return state.p_min_kw, useful
+    ctl = state.control
+    desired = min(ctl.charge_max, ctl.snap_up(state.finish_kw / ctl.kw_per_unit))
+    return ctl.charge_min, max(desired, ctl.charge_min)
 
 
-def priority_fill(states: Iterable[SessionState], headroom_kw: float) -> Setpoints:
-    """Serve sessions in the given order, each up to its useful power.
+def priority_fill(states: Iterable[SessionState], capacity: float | Allocation) -> Setpoints:
+    """Serve sessions in the given order, each up to its useful setpoint.
 
-    A session is skipped (and the next one tried) if less than its minimum power
-    is left, so the result always respects both the site headroom and the
-    minimum-current rule.
+    Args:
+        states: Sessions in priority order.
+        capacity: An :class:`Allocation` over the step's rows (updated in place),
+            or a kW headroom for the aggregate model.
+
+    A session is skipped (and the next one tried) if less than its minimum is
+    left on any row it loads, so the result always respects every row, the
+    minimum-current rule and the setpoint resolution.
     """
-    remaining = max(0.0, headroom_kw)
+    alloc = capacity if isinstance(capacity, Allocation) else Allocation.single(capacity)
     out: Setpoints = {}
     for st in states:
         if st.is_satisfied:
             continue
         lowest, useful = command_bounds(st)
-        if remaining + POWER_TOL_KW < max(lowest, POWER_TOL_KW):
+        room = st.control.snap_down(alloc.headroom(st.id))
+        if room + POWER_TOL_KW < max(lowest, POWER_TOL_KW):
             continue
-        cmd = min(useful, remaining)
+        cmd = min(useful, room)
         if cmd <= POWER_TOL_KW:
             continue
         out[st.id] = cmd
-        remaining -= cmd
+        alloc.take(st.id, cmd)
     return out
 
 
@@ -208,3 +251,77 @@ def water_fill(caps: Sequence[float], budget: float) -> list[float]:
         alloc[i] = a
         left -= a
     return alloc
+
+
+def fair_fill(
+    states: Sequence[SessionState], caps: Sequence[float], alloc: Allocation
+) -> list[float]:
+    """Max-min fair setpoints under the step's rows (progressive filling).
+
+    All sessions rise at the same rate until a cap or a row binds; sessions on
+    a binding row (or at their cap) stop and the rest continue. On the
+    aggregate model's single row this is exactly :func:`water_fill`. The levels
+    are rounded down to each session's resolution; ``alloc`` is not modified.
+    """
+    n = len(states)
+    if alloc.is_scalar:
+        return water_fill(caps, float(alloc.slack[0]))
+    level = np.zeros(n)
+    cap = np.asarray(caps, dtype=np.float64)
+    a = np.array([alloc.constraints.coefficient(st.id) for st in states]).reshape(n, -1)
+    slack = alloc.slack.copy()
+    active = [i for i in range(n) if cap[i] > POWER_TOL_KW]
+    while active:
+        rate = a[active].sum(axis=0)
+        grow = rate > 1e-12
+        t_rows = float(np.min(np.maximum(slack[grow], 0.0) / rate[grow])) if grow.any() else np.inf
+        t = max(0.0, min(t_rows, float(np.min(cap[active] - level[active]))))
+        level[active] += t
+        slack -= rate * t
+        tight = grow & (slack <= 1e-9)
+        still = [i for i in active if level[i] < cap[i] - 1e-9 and not np.any(a[i, tight] > 0)]
+        if len(still) == len(active):
+            break
+        active = still
+    return [st.control.snap_down(float(v)) for st, v in zip(states, level, strict=True)]
+
+
+def finalize(obs: Observation, desired: Mapping[str, float]) -> Setpoints:
+    """Turn continuous setpoints (e.g. from an LP) into feasible charger commands.
+
+    Setpoints are clipped to their range, rounded down to the resolution and
+    paused if that leaves them below the minimum; then they are moved toward
+    zero until every row of the step holds, which also absorbs solver
+    tolerances. Finally, a session whose setpoint finishes its request this
+    step is rounded *up* if the rows allow it: the EV stops when full, so
+    rounding up cannot over-deliver, and it avoids leaving a sliver of energy
+    undelivered at the end of a session.
+    """
+    states = {st.id: st for st in obs.sessions}
+    floors: Setpoints = {}
+    finishing: dict[str, float] = {}
+    for sid, value in desired.items():
+        st = states.get(sid)
+        if st is None or value <= POWER_TOL_KW:
+            continue
+        ctl = st.control
+        v = min(float(value), ctl.charge_max)
+        if v + POWER_TOL_KW < ctl.charge_min:
+            continue
+        if v >= st.finish_kw / ctl.kw_per_unit - 1e-9:
+            finishing[sid] = min(ctl.charge_max, ctl.snap_up(v))
+        down = ctl.snap_down(v)
+        if down + POWER_TOL_KW < ctl.charge_min:
+            continue
+        floors[sid] = max(down, ctl.charge_min)
+    controls = {sid: states[sid].control for sid in desired if sid in states}
+    fitted, _ = fit_to_rows(floors, obs.rows, controls)
+    alloc = obs.allocation()
+    for sid, v in fitted.items():
+        alloc.take(sid, v)
+    for sid, up in finishing.items():
+        extra = up - fitted.get(sid, 0.0)
+        if extra > 0 and alloc.headroom(sid) + ROW_TOL >= extra:
+            fitted[sid] = up
+            alloc.take(sid, extra)
+    return fitted
