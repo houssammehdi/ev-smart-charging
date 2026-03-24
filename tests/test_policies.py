@@ -6,6 +6,7 @@ import pytest
 from evcharge.electrical import Supply
 from evcharge.metrics import compute_metrics
 from evcharge.model import Charger, Session
+from evcharge.optim import relaxation_bound
 from evcharge.policies import (
     POLICY_FACTORIES,
     EarliestDeadlineFirst,
@@ -301,3 +302,91 @@ def test_price_aware_books_line_capacity() -> None:
     np.testing.assert_allclose(res.setpoint[1], [0.0, 16.0, 0.0, 0.0])
     np.testing.assert_allclose(res.setpoint[0], [16.0, 0.0, 16.0, 0.0])
     assert res.violations == ()
+
+
+def test_optimal_and_mpc_respect_line_limits_in_amperes() -> None:
+    # Two single-phase EVs on L1 behind a 20 A fuse: at most 20 A together, so
+    # 2 x 16 A is impossible although 7.4 kW is far below any kW limit.
+    chargers = [Charger("A", 7.4, phases=1, rotation="L1"), Charger("B", 7.4, phases=1)]
+    sessions = [Session(c.id, c.id, 0, 4, 6.0, 7.4, phases=1, efficiency=1.0) for c in chargers]
+    sc = make_scenario(sessions, chargers=chargers, supply=Supply.uniform(20.0))
+    for policy in (OptimalSchedule(), ModelPredictiveControl()):
+        res = simulate(sc, policy)
+        assert res.violations == (), policy
+        assert res.line_current_a is not None
+        assert res.line_current_a[:, 0].max() <= 20.0 + 1e-9
+        m = compute_metrics(res)
+        # 12 kWh need 52.2 A-hours at 230 V; L1 offers 4 x 20 A-hours: feasible
+        assert m.unmet_kwh == pytest.approx(0.0, abs=1e-6), policy
+
+
+def test_optimal_replay_with_whole_amps_delivers_everything() -> None:
+    # 1 A resolution: the continuous plan (e.g. 7.43 A) is rounded down each step,
+    # the shortfall is carried forward and the finishing step rounds up.
+    chargers = [Charger(f"C{i}", 11.0, current_step_a=1.0) for i in range(3)]
+    sessions = [
+        Session(f"S{i}", f"C{i}", 0, 8, 7.0 + i * 1.37, 11.0, efficiency=0.9) for i in range(3)
+    ]
+    sc = make_scenario(
+        sessions,
+        n_steps=8,
+        step_minutes=15,
+        chargers=chargers,
+        supply=Supply.uniform(25.0),
+        prices=[0.3, 0.2, 0.1, 0.1, 0.2, 0.3, 0.1, 0.4],
+        demand_charge=0.5,
+    )
+    res = simulate(sc, OptimalSchedule())
+    assert res.violations == ()
+    assert res.setpoint is not None
+    assert np.allclose(res.setpoint, np.round(res.setpoint))
+    assert compute_metrics(res).unmet_kwh == pytest.approx(0.0, abs=1e-9)
+
+
+@pytest.mark.parametrize("seed", [1, 2, 3])
+def test_kw_model_is_the_phase_model_with_idle_lines(seed: int) -> None:
+    # Three-phase EVs, continuous currents and line limits that never bind: the
+    # phase-aware site must reproduce the aggregate kW model schedule by schedule.
+    rng = np.random.default_rng(seed)
+    n = 6
+    arrivals = rng.integers(0, 6, n)
+    sessions_a = []
+    sessions_kw = []
+    for i in range(n):
+        arr = int(arrivals[i])
+        dep = int(min(16, arr + rng.integers(4, 11)))
+        energy = float(rng.uniform(2.0, 14.0))
+        sessions_a.append(Session(f"S{i}", f"C{i}", arr, dep, energy, 22.0, max_current_a=16.0))
+        sessions_kw.append(Session(f"S{i}", f"C{i}", arr, dep, energy, 16 * 0.69))
+    kwargs = {
+        "n_steps": 16,
+        "step_minutes": 15,
+        "grid_limit_kw": 20.0,
+        "prices": list(rng.uniform(0.05, 0.3, 16)),
+        "demand_charge": 0.4,
+        "base_load": list(rng.uniform(0.0, 6.0, 16)),
+    }
+    phase = make_scenario(
+        sessions_a,
+        chargers=[Charger(f"C{i}", 22.0, current_step_a=0.0) for i in range(n)],
+        supply=Supply.uniform(1000.0),
+        **kwargs,  # type: ignore[arg-type]
+    )
+    aggregate = make_scenario(
+        sessions_kw,
+        chargers=[Charger(f"C{i}", 22.0, 4.14) for i in range(n)],
+        **kwargs,  # type: ignore[arg-type]
+    )
+    for name in ("uncontrolled", "equal-share", "edf", "llf", "price-aware"):
+        a = simulate(phase, make_policy(name))
+        b = simulate(aggregate, make_policy(name))
+        assert a.violations == b.violations == ()
+        np.testing.assert_allclose(a.power_kw, b.power_kw, atol=1e-9, err_msg=name)
+    # The LPs are degenerate (ties between steps), so the solver may pick another
+    # optimal vertex; compare what is invariant: the bound and the MILP optimum.
+    assert relaxation_bound(phase) == pytest.approx(relaxation_bound(aggregate), rel=1e-7)
+    exact_phase, exact_kw = OptimalSchedule(strategy="exact"), OptimalSchedule(strategy="exact")
+    simulate(phase, exact_phase)
+    simulate(aggregate, exact_kw)
+    assert exact_phase.solution.objective == pytest.approx(exact_kw.solution.objective, rel=1e-5)
+    assert simulate(phase, ModelPredictiveControl()).violations == ()

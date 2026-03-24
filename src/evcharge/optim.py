@@ -7,10 +7,10 @@ The same formulation serves three purposes:
 * a certified lower bound on the cost of *any* feasible schedule
   (:func:`relaxation_bound`).
 
-See the README for the mathematical statement. Decision variables per LP:
+See ``docs/theory.md`` for the mathematical statement. Decision variables:
 
 ========  =======================================================
-``p``     power drawn by session *s* in step *t* (kW), only inside its window
+``x``     setpoint of session *s* in step *t* (kW, or A per phase), only in its window
 ``g, e``  site import / export in step *t* (kW)
 ``P``     peak import over the horizon (kW), ``P >= peak_floor``
 ``u``     unmet energy of session *s* (kWh), penalised
@@ -18,16 +18,21 @@ See the README for the mathematical statement. Decision variables per LP:
 ``y``     binary on/off of session *s* in step *t* (MILP only)
 ========  =======================================================
 
-Minimum-power (IEC 61851 6 A) steps are modelled as semi-continuous variables,
-``p = 0`` or ``p_min <= p <= p_max``, using the binaries ``y``. Because an EV
-stops drawing power once its request is met, commanding ``p_min`` for the
+Capacity is a set of per-step rows ``sum_s a[r, s] x[s, t] <= rhs[t, r]``: one
+kW row on aggregate sites, plus one row per line (amperes) on phase-aware sites
+(:class:`evcharge.model.RowModel`). A session's grid power is
+``kw_per_unit * x``, so the same LP handles kW and ampere setpoints.
+
+Minimum-current (IEC 61851 6 A) steps are modelled as semi-continuous variables,
+``x = 0`` or ``x_min <= x <= x_max``, using the binaries ``y``. Because an EV
+stops drawing power once its request is met, commanding the minimum for the
 final few hundred Wh is allowed; the model captures this with an overshoot
-variable ``o <= eta * p_min * dt``: energy that is commanded but never drawn.
-The plan pays for it at the import price, and in addition at the most negative
-export price of the session's window (zero if no export price is negative), so
-that undrawn energy can never look like revenue. With that term the MILP
-objective is an upper bound on the cost the simulator measures when the plan
-is replayed, and the LP relaxation (no overshoot) is a lower bound.
+variable ``o <= eta * x_min * kw_per_unit * dt``: energy that is commanded but
+never drawn. The plan pays for it at the import price, and in addition at the
+most negative export price of the session's window (zero if no export price is
+negative), so that undrawn energy can never look like revenue. With that term
+the MILP objective is an upper bound on the cost the simulator measures when
+the plan is replayed, and the LP relaxation (no overshoot) is a lower bound.
 """
 
 from __future__ import annotations
@@ -41,7 +46,7 @@ import numpy.typing as npt
 from scipy.optimize import Bounds, LinearConstraint, linprog, milp
 from scipy.sparse import coo_matrix, csr_matrix, hstack, vstack
 
-from evcharge.model import POWER_TOL_KW, FloatArray, Scenario
+from evcharge.model import POWER_TOL_KW, FloatArray, RowModel, Scenario
 
 DEFAULT_UNMET_PENALTY_EUR_PER_KWH = 100.0
 """Penalty on undelivered energy. It must exceed the marginal cost of delivering
@@ -55,7 +60,10 @@ class SolverError(RuntimeError):
 
 @dataclass(frozen=True)
 class LPSession:
-    """A session as seen by the optimiser (times are local to the LP horizon).
+    """A session as seen by the optimiser, in kW (times are local to the LP horizon).
+
+    This is the original aggregate-model input; :class:`FlexLoad` generalises it
+    to other setpoint units and constraint rows.
 
     Attributes:
         id: Session id.
@@ -76,6 +84,39 @@ class LPSession:
     p_max_kw: float
 
 
+@dataclass(frozen=True)
+class FlexLoad:
+    """A session as seen by the optimiser, in its own setpoint unit.
+
+    Attributes:
+        id: Session id.
+        start: First local step the EV is available.
+        end: First local step the EV is gone (exclusive).
+        energy_kwh: Energy still to be delivered into the battery.
+        charge_max: Maximum setpoint.
+        charge_min: Minimum non-zero setpoint (0: continuous).
+        kw_per_unit: Grid power per setpoint unit (1 for kW setpoints).
+        efficiency: Grid-to-battery efficiency.
+        rows: Coefficient of the setpoint in every constraint row of the
+            problem (``None``: 1 on every row, the aggregate model).
+    """
+
+    id: str
+    start: int
+    end: int
+    energy_kwh: float
+    charge_max: float
+    charge_min: float = 0.0
+    kw_per_unit: float = 1.0
+    efficiency: float = 1.0
+    rows: tuple[float, ...] | None = None
+
+    @classmethod
+    def from_lp_session(cls, s: LPSession) -> FlexLoad:
+        """The kW-model session as a :class:`FlexLoad`."""
+        return cls(s.id, s.start, s.end, s.energy_kwh, s.p_max_kw, s.p_min_kw, 1.0, s.efficiency)
+
+
 Strategy = Literal["exact", "relax-and-fix"]
 """How the minimum-power rule is solved: a full MILP, or the LP relaxation
 followed by a small MILP over the entries the relaxation left fractional."""
@@ -90,7 +131,8 @@ class ScheduleProblem:
         price: Import price per step (EUR/kWh).
         export_price: Export price per step (EUR/kWh).
         net_base_kw: Base load minus PV per step (kW).
-        grid_limit_kw: Import limit at the connection point.
+        grid_limit_kw: Import limit at the connection point (used when
+            ``rows`` is ``None``).
         demand_charge: EUR per kW of peak import.
         sessions: Sessions to schedule.
         peak_floor_kw: Peak import already incurred (MPC); the peak cost is
@@ -101,6 +143,8 @@ class ScheduleProblem:
             and ``0`` gives a pure LP (minimum power relaxed).
         quick_charge_weight: Optional regulariser in EUR per kWh per hour of
             delay that favours charging early; 0 gives the pure cost objective.
+        rows: Per-step capacity rows over the local horizon. ``None`` means the
+            aggregate model's single row ``sum x <= grid_limit_kw - net_base_kw``.
     """
 
     dt_h: float
@@ -109,11 +153,12 @@ class ScheduleProblem:
     net_base_kw: FloatArray
     grid_limit_kw: float
     demand_charge: float
-    sessions: tuple[LPSession, ...]
+    sessions: tuple[LPSession | FlexLoad, ...]
     peak_floor_kw: float = 0.0
     unmet_penalty: float = DEFAULT_UNMET_PENALTY_EUR_PER_KWH
     min_power_steps: int | None = None
     quick_charge_weight: float = 0.0
+    rows: RowModel | None = None
 
     @property
     def n_steps(self) -> int:
@@ -126,7 +171,7 @@ class ScheduleSolution:
     """Output of :func:`solve_schedule`.
 
     Attributes:
-        power_kw: Commanded power, shape ``(n_sessions, T)``.
+        power_kw: Commanded grid power, shape ``(n_sessions, T)``.
         unmet_kwh: Undelivered energy per session.
         import_kw: Site import per step.
         export_kw: Site export per step.
@@ -137,6 +182,8 @@ class ScheduleSolution:
         status: ``"optimal"`` or ``"time_limit"`` (MILP with incumbent).
         n_binaries: Number of binary variables in the final solve.
         solve_time_s: Wall-clock time spent in the solver(s).
+        setpoint: Commanded setpoints in each session's unit (equal to
+            ``power_kw`` for kW setpoints).
     """
 
     power_kw: FloatArray
@@ -149,6 +196,7 @@ class ScheduleSolution:
     status: str
     n_binaries: int
     solve_time_s: float
+    setpoint: FloatArray
 
     @property
     def gap(self) -> float:
@@ -181,13 +229,33 @@ def _milp_bound(res: object) -> float:
     return float(bound)
 
 
+def _flex_loads(problem: ScheduleProblem) -> tuple[list[FlexLoad], FloatArray, int]:
+    """Sessions as :class:`FlexLoad`, the row right-hand sides ``(T, R)`` and ``R``."""
+    loads = [
+        s if isinstance(s, FlexLoad) else FlexLoad.from_lp_session(s) for s in problem.sessions
+    ]
+    if problem.rows is None:
+        rhs = np.maximum(0.0, problem.grid_limit_kw - problem.net_base_kw)[:, None]
+    else:
+        rhs = np.asarray(problem.rows.rhs, dtype=np.float64)
+        if rhs.shape[0] != problem.n_steps:
+            raise ValueError(f"rows cover {rhs.shape[0]} steps, the problem {problem.n_steps}")
+    n_rows = int(rhs.shape[1])
+    for s in loads:
+        if s.rows is not None and len(s.rows) != n_rows:
+            raise ValueError(f"session {s.id}: {len(s.rows)} row coefficients for {n_rows} rows")
+        if s.rows is None and n_rows != 1:
+            raise ValueError(f"session {s.id}: row coefficients are required with {n_rows} rows")
+    return loads, rhs, n_rows
+
+
 class _Model:
     """Sparse matrices of one :class:`ScheduleProblem`, reusable across solves."""
 
     def __init__(self, problem: ScheduleProblem) -> None:
         self.problem = problem
         n_t = problem.n_steps
-        sessions = problem.sessions
+        sessions, rhs, n_rows = _flex_loads(problem)
         n_s = len(sessions)
         dt = problem.dt_h
         for s in sessions:
@@ -200,14 +268,17 @@ class _Model:
         n_p = int(p_sess.size)
         self.n_t, self.n_s, self.n_p = n_t, n_s, n_p
         self.p_sess, self.p_time = p_sess, p_time
-        p_min = np.array([s.p_min_kw for s in sessions], dtype=np.float64)
-        self.p_max = np.array([s.p_max_kw for s in sessions], dtype=np.float64)[p_sess]
+        c_min = np.array([s.charge_min for s in sessions], dtype=np.float64)
+        self.p_max = np.array([s.charge_max for s in sessions], dtype=np.float64)[p_sess]
+        unit_kw = np.array([s.kw_per_unit for s in sessions], dtype=np.float64)
+        self.unit_kw = unit_kw
+        k = unit_kw[p_sess]
         eta = np.array([s.efficiency for s in sessions], dtype=np.float64)
         energy = np.array([s.energy_kwh for s in sessions], dtype=np.float64)
 
         int_horizon = n_t if problem.min_power_steps is None else problem.min_power_steps
-        self.p_min = p_min[p_sess]
-        #: power entries subject to the semi-continuous minimum-power rule
+        self.p_min = c_min[p_sess]
+        #: setpoint entries subject to the semi-continuous minimum-current rule
         self.eligible = (p_time < int_horizon) & (self.p_min > POWER_TOL_KW)
         has_min = np.zeros(n_s, dtype=bool)
         has_min[p_sess[self.eligible]] = True
@@ -220,7 +291,7 @@ class _Model:
         self.n_cont = self.off_o + n_s
 
         c = np.zeros(self.n_cont)
-        c[:n_p] = problem.quick_charge_weight * p_time * dt * dt
+        c[:n_p] = problem.quick_charge_weight * p_time * dt * (k * dt)
         c[self.off_g : self.off_e] = problem.price * dt
         c[self.off_e : self.off_peak] = -problem.export_price * dt
         c[self.off_peak] = problem.demand_charge
@@ -242,14 +313,14 @@ class _Model:
         floor = problem.peak_floor_kw
         lb[self.off_peak] = floor if floor >= NUMERIC_ZERO else 0.0
         ub[self.off_u : self.off_o] = energy
-        # Commanding p_min to finish a request is allowed: the EV stops by itself.
-        ub[self.off_o :] = np.where(has_min, eta * p_min * dt, 0.0)
+        # Commanding the minimum to finish a request is allowed: the EV stops by itself.
+        ub[self.off_o :] = np.where(has_min, eta * c_min * unit_kw * dt, 0.0)
         self.lb, self.ub = lb, ub
 
         cols_p = np.arange(n_p)
         t_idx = np.arange(n_t)
         s_idx = np.arange(n_s)
-        # Power balance: sum_s p - g + e = -(base - pv); energy: sum eta p dt + u - o = E.
+        # Power balance: sum_s k x - g + e = -(base - pv); energy: sum eta k x dt + u - o = E.
         rows = np.concatenate([p_time, t_idx, t_idx, n_t + p_sess, n_t + s_idx, n_t + s_idx])
         cols = np.concatenate(
             [
@@ -263,23 +334,28 @@ class _Model:
         )
         vals = np.concatenate(
             [
-                np.ones(n_p),
+                k,
                 -np.ones(n_t),
                 np.ones(n_t),
-                eta[p_sess] * dt,
+                eta[p_sess] * k * dt,
                 np.ones(n_s),
                 -np.ones(n_s),
             ]
         )
         self.a_eq = coo_matrix((vals, (rows, cols)), shape=(n_t + n_s, self.n_cont)).tocsr()
         self.b_eq = _snap(np.concatenate([-problem.net_base_kw, energy]))
-        # Site headroom: sum_s p <= L - (base - pv); peak: g - P <= 0.
-        rows = np.concatenate([p_time, n_t + t_idx, n_t + t_idx])
-        cols = np.concatenate([cols_p, self.off_g + t_idx, np.full(n_t, self.off_peak)])
-        vals = np.concatenate([np.ones(n_p), np.ones(n_t), -np.ones(n_t)])
-        self.a_ub = coo_matrix((vals, (rows, cols)), shape=(2 * n_t, self.n_cont)).tocsr()
-        headroom = _snap(np.maximum(0.0, problem.grid_limit_kw - problem.net_base_kw))
-        self.b_ub = np.concatenate([headroom, np.zeros(n_t)])
+        # Capacity rows: sum_s a[r, s] x[s, t] <= rhs[t, r] (row t * R + r); peak: g - P <= 0.
+        coef = np.array(
+            [s.rows if s.rows is not None else (1.0,) * n_rows for s in sessions], dtype=np.float64
+        ).reshape(n_s, n_rows)
+        entry_coef = coef[p_sess]
+        nz_entry, nz_row = np.nonzero(entry_coef)
+        n_cap = n_t * n_rows
+        rows = np.concatenate([p_time[nz_entry] * n_rows + nz_row, n_cap + t_idx, n_cap + t_idx])
+        cols = np.concatenate([cols_p[nz_entry], self.off_g + t_idx, np.full(n_t, self.off_peak)])
+        vals = np.concatenate([entry_coef[nz_entry, nz_row], np.ones(n_t), -np.ones(n_t)])
+        self.a_ub = coo_matrix((vals, (rows, cols)), shape=(n_cap + n_t, self.n_cont)).tocsr()
+        self.b_ub = np.concatenate([_snap(rhs).reshape(-1), np.zeros(n_t)])
 
     def solve(
         self,
@@ -290,7 +366,7 @@ class _Model:
         time_limit_s: float | None,
         mip_rel_gap: float,
     ) -> tuple[FloatArray, float, float, str]:
-        """Solve with the given power bounds; ``binaries`` index semi-continuous entries.
+        """Solve with the given setpoint bounds; ``binaries`` index semi-continuous entries.
 
         Returns ``(x, objective, lower_bound, status)``.
         """
@@ -313,7 +389,7 @@ class _Model:
                 raise SolverError(f"HiGHS LP failed: {res.message}")
             return np.asarray(res.x, dtype=np.float64), float(res.fun), float(res.fun), "optimal"
 
-        # p_i - p_max y_i <= 0 and p_min y_i - p_i <= 0 for every binary entry i.
+        # x_i - x_max y_i <= 0 and x_min y_i - x_i <= 0 for every binary entry i.
         n_var = self.n_cont + n_y
         y_cols = self.n_cont + np.arange(n_y)
         y_rows = np.arange(n_y)
@@ -373,10 +449,10 @@ class _Model:
     ) -> ScheduleSolution:
         p = np.clip(x[: self.n_p], 0.0, self.p_max)
         p[p < POWER_TOL_KW] = 0.0
-        power = np.zeros((self.n_s, self.n_t))
-        power[self.p_sess, self.p_time] = p
+        setpoint = np.zeros((self.n_s, self.n_t))
+        setpoint[self.p_sess, self.p_time] = p
         return ScheduleSolution(
-            power_kw=power,
+            power_kw=setpoint * self.unit_kw[:, None],
             unmet_kwh=np.maximum(0.0, x[self.off_u : self.off_o]),
             import_kw=x[self.off_g : self.off_e],
             export_kw=x[self.off_e : self.off_peak],
@@ -386,6 +462,7 @@ class _Model:
             status=status,
             n_binaries=n_y,
             solve_time_s=elapsed,
+            setpoint=setpoint,
         )
 
 
@@ -405,9 +482,9 @@ def solve_schedule(
         problem: The problem instance.
         strategy: ``"exact"`` solves the full MILP. ``"relax-and-fix"`` solves
             the LP relaxation, fixes every entry the relaxation left at 0 (off)
-            or at >= ``p_min`` (on), and solves a small MILP over the remaining
-            fractional entries. It is a heuristic, but the relaxation gives a
-            certified :attr:`ScheduleSolution.lower_bound`.
+            or at >= the minimum (on), and solves a small MILP over the
+            remaining fractional entries. It is a heuristic, but the relaxation
+            gives a certified :attr:`ScheduleSolution.lower_bound`.
         time_limit_s: HiGHS time limit for MILP solves.
         mip_rel_gap: Relative MIP gap at which HiGHS stops.
 
@@ -444,6 +521,27 @@ def solve_schedule(
     )
 
 
+def flex_loads_from_scenario(scenario: Scenario) -> tuple[FlexLoad, ...]:
+    """Every session of ``scenario`` as a :class:`FlexLoad` on the full horizon."""
+    loads = []
+    for s in scenario.sessions:
+        ctl = scenario.control(s)
+        loads.append(
+            FlexLoad(
+                id=s.id,
+                start=s.arrival_step,
+                end=s.departure_step,
+                energy_kwh=s.energy_kwh,
+                charge_max=ctl.charge_max,
+                charge_min=ctl.charge_min,
+                kw_per_unit=ctl.kw_per_unit,
+                efficiency=s.efficiency,
+                rows=tuple(float(a) for a in scenario.row_coefficients(s)),
+            )
+        )
+    return tuple(loads)
+
+
 def problem_from_scenario(
     scenario: Scenario,
     *,
@@ -451,20 +549,6 @@ def problem_from_scenario(
     unmet_penalty: float = DEFAULT_UNMET_PENALTY_EUR_PER_KWH,
 ) -> ScheduleProblem:
     """Build the full-horizon, perfect-foresight problem of a scenario."""
-    sessions = []
-    for s in scenario.sessions:
-        p_min, p_max = scenario.power_bounds(s)
-        sessions.append(
-            LPSession(
-                id=s.id,
-                start=s.arrival_step,
-                end=s.departure_step,
-                energy_kwh=s.energy_kwh,
-                efficiency=s.efficiency,
-                p_min_kw=p_min,
-                p_max_kw=p_max,
-            )
-        )
     return ScheduleProblem(
         dt_h=scenario.horizon.dt_h,
         price=scenario.tariff.price_eur_per_kwh,
@@ -472,9 +556,10 @@ def problem_from_scenario(
         net_base_kw=scenario.net_base_kw,
         grid_limit_kw=scenario.site.grid_limit_kw,
         demand_charge=scenario.tariff.demand_charge_eur_per_kw,
-        sessions=tuple(sessions),
+        sessions=flex_loads_from_scenario(scenario),
         unmet_penalty=unmet_penalty,
         min_power_steps=min_power_steps,
+        rows=scenario.rows,
     )
 
 
@@ -483,9 +568,15 @@ def relaxation_bound(
 ) -> float:
     """Lower bound on the penalised cost of any feasible schedule for ``scenario``.
 
-    This is the perfect-foresight LP with the minimum-power rule relaxed. Every
-    schedule a policy can execute in the simulator is feasible for it, so its
-    optimum bounds ``energy cost + demand charge + penalty * unmet`` from below.
+    This is the perfect-foresight LP with the minimum-current rule (and the
+    setpoint resolution) relaxed. Every schedule a policy can execute in the
+    simulator is feasible for it, so its optimum bounds
+    ``energy cost + demand charge + penalty * unmet`` from below.
     """
     problem = problem_from_scenario(scenario, min_power_steps=0, unmet_penalty=unmet_penalty)
     return solve_schedule(problem).objective
+
+
+def slice_rows(rows: RowModel, start: int, stop: int) -> RowModel:
+    """The rows of steps ``[start, stop)`` (for a rolling-horizon problem)."""
+    return RowModel(rows.names, rows.kinds, rows.rhs[start:stop])

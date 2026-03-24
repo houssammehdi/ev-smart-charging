@@ -9,7 +9,10 @@ Only guaranteed properties are asserted:
 * without minimum powers the offline optimum is a pure LP, so its cost is no
   higher than any policy's;
 * with perfect information (all EVs present from the start) and no
-  regulariser, MPC recovers the offline optimum (Bellman's principle).
+  regulariser, MPC recovers the offline optimum (Bellman's principle);
+* on phase-aware sites (TN and IT, any rotation, 1/2/3-phase EVs, any
+  resolution) no line and no site row is ever exceeded by any policy, and
+  every setpoint is on the charger's grid and within its range.
 """
 
 from __future__ import annotations
@@ -21,8 +24,9 @@ import numpy as np
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
+from evcharge.electrical import GridType, Supply, three_phase_kw_per_a
 from evcharge.metrics import compute_metrics
-from evcharge.model import Charger, Horizon, Scenario, Session, Site, Tariff
+from evcharge.model import Charger, Horizon, Scenario, Session, Site, Tariff, on_grid
 from evcharge.optim import relaxation_bound
 from evcharge.policies import (
     POLICY_FACTORIES,
@@ -176,3 +180,120 @@ def test_mpc_with_perfect_information_is_optimal(sc: Scenario) -> None:
         simulate(sc, ModelPredictiveControl(quick_charge_weight=0.0))
     ).penalised_cost_eur
     assert abs(mpc - optimal) <= cost_tol(optimal)
+
+
+ROTATIONS_3PH = ["L1L2L3", "L2L3L1", "L3L1L2", "L1L3L2"]
+ROTATIONS_1PH = {"TN": ["L1", "L2", "L3"], "IT": ["L1L2", "L2L3", "L1L3"]}
+
+
+@st.composite
+def phase_scenarios(draw: st.DrawFn) -> Scenario:
+    grid = draw(st.sampled_from(["TN", "IT"]))
+    n_steps = draw(st.integers(3, 8))
+    step_minutes = draw(st.sampled_from([15, 30, 60]))
+    limits = tuple(draw(st.floats(12.0, 80.0)) for _ in range(3))
+    chargers = []
+    for i in range(draw(st.integers(1, 4))):
+        phases = draw(st.sampled_from([1, 3]))
+        rotation = draw(st.sampled_from(ROTATIONS_3PH if phases == 3 else ROTATIONS_1PH[grid]))
+        chargers.append(
+            Charger(
+                f"C{i}",
+                22.0,
+                phases=phases,
+                rotation=rotation,
+                max_current_a=draw(st.sampled_from([10.0, 16.0, 32.0])),
+                current_step_a=draw(st.sampled_from([0.0, 0.1, 1.0])),
+            )
+        )
+    sessions = []
+    ev_phases = [1, 2, 3] if grid == "TN" else [1, 3]
+    for c in chargers:
+        t = 0
+        for _ in range(draw(st.integers(0, 2))):
+            arrival = draw(st.integers(t, n_steps - 1))
+            departure = draw(st.integers(arrival + 1, n_steps))
+            sessions.append(
+                Session(
+                    id=f"S{len(sessions)}",
+                    charger_id=c.id,
+                    arrival_step=arrival,
+                    departure_step=departure,
+                    energy_kwh=draw(st.floats(0.2, 40.0)),
+                    max_power_kw=22.0,
+                    efficiency=draw(st.floats(0.8, 1.0)),
+                    phases=draw(st.sampled_from(ev_phases)),
+                    max_current_a=draw(st.sampled_from([6.0, 13.0, 16.0, 32.0])),
+                )
+            )
+            t = departure
+            if t >= n_steps:
+                break
+    lim = np.array(limits)
+    base = (
+        np.array(
+            draw(st.lists(st.floats(0.0, 0.7), min_size=3 * n_steps, max_size=3 * n_steps))
+        ).reshape(n_steps, 3)
+        * lim
+    )
+    pv = (
+        np.array(
+            draw(st.lists(st.floats(0.0, 0.6), min_size=3 * n_steps, max_size=3 * n_steps))
+        ).reshape(n_steps, 3)
+        * lim
+    )
+    kw_per_a = three_phase_kw_per_a(GridType(grid), 230.0)
+    base_kw = base.mean(axis=1) * kw_per_a
+    pv_kw = pv.mean(axis=1) * kw_per_a
+    limit_kw = float(max(draw(st.floats(5.0, 120.0)), float((base_kw - pv_kw).max()) + 1.0))
+    price = np.array(draw(st.lists(st.floats(-0.05, 0.5), min_size=n_steps, max_size=n_steps)))
+    return Scenario(
+        name="random-phase",
+        horizon=Horizon(datetime(2026, 1, 5), n_steps, step_minutes),
+        site=Site(limit_kw, tuple(chargers), Supply(limits, GridType(grid))),
+        tariff=Tariff(price, price - 0.02, draw(st.floats(0.0, 3.0))),
+        sessions=tuple(sessions),
+        base_load_kw=base_kw,
+        pv_kw=pv_kw,
+        base_current_a=base,
+        pv_current_a=pv,
+    )
+
+
+@PROPERTY_SETTINGS
+@given(phase_scenarios())
+def test_no_policy_overloads_a_line(sc: Scenario) -> None:
+    rows = sc.rows
+    coef = np.array([sc.row_coefficients(s) for s in sc.sessions]).reshape(
+        len(sc.sessions), rows.n_rows
+    )
+    assert sc.site.supply is not None
+    limits = np.array(sc.site.supply.line_limit_a)
+    for policy in all_policies():
+        res = simulate(sc, policy)  # type: ignore[arg-type]
+        assert res.violations == (), (policy, res.violations)
+        assert res.setpoint is not None
+        assert res.line_current_a is not None
+        # every line within its limit, and every row (lines and site kW) holds
+        assert np.all(res.line_current_a <= limits[None, :] + TOL), policy
+        usage = res.setpoint.T @ coef
+        assert np.all(usage <= rows.rhs + TOL), policy
+        assert np.all(res.net_import_kw <= sc.site.grid_limit_kw + TOL)
+        for i, s in enumerate(sc.sessions):
+            ctl = sc.control(s)
+            x = res.setpoint[i]
+            assert np.all((x == 0.0) | ((x >= ctl.charge_min - TOL) & (x <= ctl.charge_max + TOL)))
+            assert all(on_grid(float(v), ctl.step) for v in x), (policy, x, ctl.step)
+            outside = np.ones(sc.horizon.n_steps, dtype=bool)
+            outside[s.arrival_step : s.departure_step] = False
+            assert np.all(x[outside] == 0.0)
+            assert res.delivered_kwh[i] <= s.energy_kwh + TOL
+
+
+@PROPERTY_SETTINGS
+@given(phase_scenarios())
+def test_relaxation_bounds_every_policy_on_phase_sites(sc: Scenario) -> None:
+    bound = relaxation_bound(sc)
+    for policy in all_policies():
+        m = compute_metrics(simulate(sc, policy))  # type: ignore[arg-type]
+        assert bound <= m.penalised_cost_eur + cost_tol(bound), policy

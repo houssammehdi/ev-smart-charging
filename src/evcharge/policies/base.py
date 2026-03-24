@@ -286,20 +286,27 @@ def fair_fill(
     return [st.control.snap_down(float(v)) for st, v in zip(states, level, strict=True)]
 
 
+FINISH_TOL = 1e-4
+"""A setpoint within this much (in its unit) of the finishing setpoint counts as finishing.
+
+It is far above solver tolerances and far below any physical resolution."""
+
+
 def finalize(obs: Observation, desired: Mapping[str, float]) -> Setpoints:
     """Turn continuous setpoints (e.g. from an LP) into feasible charger commands.
 
-    Setpoints are clipped to their range, rounded down to the resolution and
-    paused if that leaves them below the minimum; then they are moved toward
-    zero until every row of the step holds, which also absorbs solver
-    tolerances. Finally, a session whose setpoint finishes its request this
-    step is rounded *up* if the rows allow it: the EV stops when full, so
-    rounding up cannot over-deliver, and it avoids leaving a sliver of energy
-    undelivered at the end of a session.
+    Setpoints are clipped to their range and first rounded down to the
+    resolution, pausing any that fall below the minimum; then they are moved
+    toward zero until every row of the step holds, which also absorbs solver
+    tolerances. Finally setpoints are rounded *up* where every row still
+    allows it: first those that finish their session's request this step (the
+    EV stops when full, so rounding up cannot over-deliver), then those whose
+    nearest grid value is the upper one, largest remainder first. On
+    continuous setpoints (kW model) only the clipping and the row check apply.
     """
     states = {st.id: st for st in obs.sessions}
     floors: Setpoints = {}
-    finishing: dict[str, float] = {}
+    ups: list[tuple[float, str, float]] = []
     for sid, value in desired.items():
         st = states.get(sid)
         if st is None or value <= POWER_TOL_KW:
@@ -308,20 +315,23 @@ def finalize(obs: Observation, desired: Mapping[str, float]) -> Setpoints:
         v = min(float(value), ctl.charge_max)
         if v + POWER_TOL_KW < ctl.charge_min:
             continue
-        if v >= st.finish_kw / ctl.kw_per_unit - 1e-9:
-            finishing[sid] = min(ctl.charge_max, ctl.snap_up(v))
-        down = ctl.snap_down(v)
-        if down + POWER_TOL_KW < ctl.charge_min:
-            continue
-        floors[sid] = max(down, ctl.charge_min)
-    controls = {sid: states[sid].control for sid in desired if sid in states}
+        down = max(ctl.snap_down(v), ctl.charge_min)
+        floors[sid] = down
+        up = min(ctl.charge_max, ctl.snap_up(v))
+        if up > down + POWER_TOL_KW:
+            if v >= st.finish_kw / ctl.kw_per_unit - FINISH_TOL:
+                ups.append((2.0, sid, up))
+            elif v - down >= 0.5 * (up - down):
+                ups.append(((v - down) / (up - down), sid, up))
+    controls = {sid: states[sid].control for sid in floors}
     fitted, _ = fit_to_rows(floors, obs.rows, controls)
     alloc = obs.allocation()
     for sid, v in fitted.items():
         alloc.take(sid, v)
-    for sid, up in finishing.items():
-        extra = up - fitted.get(sid, 0.0)
-        if extra > 0 and alloc.headroom(sid) + ROW_TOL >= extra:
+    for _, sid, up in sorted(ups, key=lambda u: (-u[0], u[1])):
+        base = fitted.get(sid, 0.0)
+        extra = up - base
+        if base > 0.0 and extra > 0.0 and alloc.headroom(sid) + ROW_TOL >= extra:
             fitted[sid] = up
             alloc.take(sid, extra)
     return fitted

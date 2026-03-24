@@ -5,7 +5,9 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from evcharge.model import RowModel
 from evcharge.optim import (
+    FlexLoad,
     LPSession,
     ScheduleProblem,
     _milp_bound,
@@ -144,3 +146,31 @@ def test_a_zero_dual_bound_is_kept() -> None:
     assert _milp_bound(SimpleNamespace(mip_dual_bound=None, fun=5.0)) == 5.0
     assert _milp_bound(SimpleNamespace(mip_dual_bound=float("nan"), fun=5.0)) == 5.0
     assert _milp_bound(SimpleNamespace(fun=5.0)) == 5.0
+
+
+def test_flex_loads_in_amperes_share_a_line_row() -> None:
+    # Two single-phase EVs (0.23 kW/A) on one line of 20 A, plus a 10 kW site row.
+    rows = RowModel(("L1 import", "site import"), ("line", "site"), np.tile([20.0, 10.0], (4, 1)))
+    loads = (
+        FlexLoad("A", 0, 4, 4.6, charge_max=16.0, kw_per_unit=0.23, rows=(1.0, 0.23)),
+        FlexLoad("B", 0, 4, 4.6, charge_max=16.0, kw_per_unit=0.23, rows=(1.0, 0.23)),
+    )
+    sol = solve_schedule(problem(loads, rows=rows, price=np.array([0.1, 0.2, 0.3, 0.4])))
+    # each needs 20 A-steps at 1 h; the cheapest step holds only 20 A in total
+    assert sol.setpoint[:, 0].sum() == pytest.approx(20.0)
+    assert sol.setpoint.sum() == pytest.approx(40.0)
+    np.testing.assert_allclose(sol.power_kw, sol.setpoint * 0.23)
+    assert sol.unmet_kwh.sum() == pytest.approx(0.0, abs=1e-9)
+    assert (sol.setpoint.sum(axis=0) <= 20.0 + 1e-9).all()
+
+
+def test_row_inputs_are_validated() -> None:
+    rows = RowModel(("a", "b"), ("line", "site"), np.ones((4, 2)))
+    with pytest.raises(ValueError, match="row coefficients are required"):
+        solve_schedule(problem((lp_session(1.0),), rows=rows))
+    bad = FlexLoad("A", 0, 4, 1.0, charge_max=5.0, rows=(1.0,))
+    with pytest.raises(ValueError, match="1 row coefficients for 2 rows"):
+        solve_schedule(problem((bad,), rows=rows))
+    short = RowModel(("a",), ("site",), np.ones((3, 1)))
+    with pytest.raises(ValueError, match="cover 3 steps"):
+        solve_schedule(problem((lp_session(1.0),), rows=short))
