@@ -28,15 +28,10 @@ class OptimalSchedule:
     IEC 61851 minimum it is a MILP; the default ``"relax-and-fix"`` strategy
     solves it in well under a second on the built-in scenarios with a
     certified gap (see :attr:`solution`), while ``"exact"`` runs the full MILP.
-    It is a benchmark, not a deployable controller: real sites do not know
-    tomorrow's arrivals.
-
-    The plan is continuous. On chargers with a current resolution the replay
-    works like a sigma-delta modulator: each planned setpoint is corrected by
-    the session's energy lead or lag against the plan and rounded to the grid
-    (see :func:`~evcharge.policies.base.finalize`), so the delivered energy
-    tracks the plan to within one resolution step and a finishing step rounds
-    up; the EV stops when full.
+    On chargers with a current resolution a final rounding MILP puts every
+    setpoint on the charger's grid (``solve_schedule(..., round_to_grid=True)``),
+    so the replay is exactly the plan. It is a benchmark, not a deployable
+    controller: real sites do not know tomorrow's arrivals.
 
     Args:
         unmet_penalty: EUR per kWh of undelivered energy.
@@ -62,7 +57,6 @@ class OptimalSchedule:
         self.time_limit_s = time_limit_s
         self.mip_rel_gap = mip_rel_gap
         self._plan: dict[str, FloatArray] = {}
-        self._planned_kwh: dict[str, FloatArray] = {}
         self._solution: ScheduleSolution | None = None
 
     @property
@@ -80,31 +74,14 @@ class OptimalSchedule:
             strategy=self.strategy,
             time_limit_s=self.time_limit_s,
             mip_rel_gap=self.mip_rel_gap,
+            round_to_grid=True,
         )
         self._solution = solution
-        dt = scenario.horizon.dt_h
-        self._plan = {}
-        self._planned_kwh = {}
-        for i, s in enumerate(scenario.sessions):
-            plan = solution.setpoint[i]
-            self._plan[s.id] = plan
-            per_unit = s.efficiency * scenario.control(s).kw_per_unit * dt
-            # battery energy the plan has delivered before each step (the EV stops when full)
-            cum = np.concatenate([[0.0], np.cumsum(plan * per_unit)])
-            self._planned_kwh[s.id] = np.minimum(cum, s.energy_kwh)
-
-    def _replay(self, st: SessionState, step: int) -> float:
-        value = float(self._plan[st.id][step])
-        ctl = st.control
-        if value > 0.0 and ctl.step > 0.0:
-            per_unit = st.session.efficiency * ctl.kw_per_unit * st.dt_h
-            behind = float(self._planned_kwh[st.id][step]) - st.delivered_kwh
-            value = max(ctl.charge_min, value + behind / per_unit)
-        return value
+        self._plan = {s.id: solution.setpoint[i] for i, s in enumerate(scenario.sessions)}
 
     def decide(self, obs: Observation) -> Mapping[str, float]:
         """Replay the pre-computed plan."""
-        desired = {st.id: self._replay(st, obs.step) for st in obs.sessions}
+        desired = {st.id: float(self._plan[st.id][obs.step]) for st in obs.sessions}
         return finalize(obs, {sid: v for sid, v in desired.items() if v > 0.0})
 
     def __repr__(self) -> str:
@@ -129,6 +106,20 @@ def flex_load(st: SessionState, obs: Observation) -> FlexLoad:
         efficiency=st.session.efficiency,
         rows=tuple(float(a) for a in obs.rows.coefficient(st.id)),
     )
+
+
+def spare_later(pending: list[SessionState], setpoint: FloatArray) -> dict[str, float]:
+    """Spare setpoint of each session in the rest of its window after the first step.
+
+    MPC re-plans every step, so any later step can absorb a rounding loss (as
+    far as capacity allows); the planned values only say how much each step
+    already uses.
+    """
+    out: dict[str, float] = {}
+    for i, st in enumerate(pending):
+        tail = setpoint[i, 1 : st.steps_left]
+        out[st.id] = float(np.sum(st.control.charge_max - tail))
+    return out
 
 
 class ModelPredictiveControl(OnlinePolicy):
@@ -206,7 +197,7 @@ class ModelPredictiveControl(OnlinePolicy):
             for i, st in enumerate(pending)
             if solution.setpoint[i, 0] > 0.0
         }
-        return finalize(obs, desired)
+        return finalize(obs, desired, room_later=spare_later(pending, solution.setpoint))
 
     def __repr__(self) -> str:
         return f"ModelPredictiveControl(quick_charge_weight={self.quick_charge_weight})"

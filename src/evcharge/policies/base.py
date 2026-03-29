@@ -18,14 +18,15 @@ exactly to the original single-headroom arithmetic.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+import math
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import cached_property
 from typing import Protocol, runtime_checkable
 
 import numpy as np
 
-from evcharge.capacity import ROW_TOL, Allocation, StepConstraints, fit_to_rows
+from evcharge.capacity import ROW_TOL, Allocation, StepConstraints, trim_to_rows
 from evcharge.model import ENERGY_TOL_KWH, POWER_TOL_KW, Control, Scenario, Session
 
 Setpoints = dict[str, float]
@@ -292,19 +293,38 @@ FINISH_TOL = 1e-4
 It is far above solver tolerances and far below any physical resolution."""
 
 
-def finalize(obs: Observation, desired: Mapping[str, float]) -> Setpoints:
+def finalize(
+    obs: Observation,
+    desired: Mapping[str, float],
+    *,
+    room_later: Mapping[str, float] | None = None,
+) -> Setpoints:
     """Turn continuous setpoints (e.g. from an LP) into feasible charger commands.
 
     Setpoints are clipped to their range and first rounded down to the
-    resolution, pausing any that fall below the minimum; then they are moved
-    toward zero until every row of the step holds, which also absorbs solver
-    tolerances. Finally setpoints are rounded *up* where every row still
-    allows it: first those that finish their session's request this step (the
-    EV stops when full, so rounding up cannot over-deliver), then those whose
-    nearest grid value is the upper one, largest remainder first. On
-    continuous setpoints (kW model) only the clipping and the row check apply.
+    resolution, pausing any that fall below the minimum; then the most
+    flexible ones (most spare setpoint later, then largest margin above the
+    minimum) are trimmed until every row of the step holds, which also absorbs
+    solver tolerances (see :func:`~evcharge.capacity.trim_to_rows`). Finally
+    setpoints are rounded *up* where every row still allows it, most urgent
+    first:
+
+    1. sessions that finish their request in their last connected step (the
+       EV stops when full, so rounding up cannot over-deliver);
+    2. sessions whose rounding loss cannot be made up later, because the
+       spare setpoint they have in later steps (``room_later``, in
+       setpoint-steps; unlimited if not given) is smaller than the loss;
+    3. other sessions that finish their request this step;
+    4. sessions whose nearest grid value is the upper one, largest remainder first.
+
+    If an urgent (1 or 2) round-up does not fit, a session that can make up a
+    loss later is lowered by one resolution step to make room, when that
+    suffices. On continuous setpoints (kW model) only the clipping and the row
+    check apply.
     """
     states = {st.id: st for st in obs.sessions}
+    later = dict(room_later) if room_later is not None else {}
+    target: dict[str, float] = {}
     floors: Setpoints = {}
     ups: list[tuple[float, str, float]] = []
     for sid, value in desired.items():
@@ -315,23 +335,72 @@ def finalize(obs: Observation, desired: Mapping[str, float]) -> Setpoints:
         v = min(float(value), ctl.charge_max)
         if v + POWER_TOL_KW < ctl.charge_min:
             continue
+        target[sid] = v
         down = max(ctl.snap_down(v), ctl.charge_min)
         floors[sid] = down
         up = min(ctl.charge_max, ctl.snap_up(v))
         if up > down + POWER_TOL_KW:
-            if v >= st.finish_kw / ctl.kw_per_unit - FINISH_TOL:
+            last = st.steps_left <= 1
+            finishing = v >= st.finish_kw / ctl.kw_per_unit - FINISH_TOL
+            room = 0.0 if last else later.get(sid, math.inf)
+            if last and finishing:
+                ups.append((4.0, sid, up))
+            elif v - down > room + FINISH_TOL:
+                ups.append((3.0, sid, up))
+            elif finishing:
                 ups.append((2.0, sid, up))
             elif v - down >= 0.5 * (up - down):
                 ups.append(((v - down) / (up - down), sid, up))
     controls = {sid: states[sid].control for sid in floors}
-    fitted, _ = fit_to_rows(floors, obs.rows, controls)
+
+    def room_left(sid: str, x: float) -> float:
+        # spare setpoint later minus what this step already leaves to make up
+        return later.get(sid, math.inf) - (target[sid] - x)
+
+    fitted = trim_to_rows(floors, obs.rows, controls, rank=room_left)
     alloc = obs.allocation()
     for sid, v in fitted.items():
         alloc.take(sid, v)
-    for _, sid, up in sorted(ups, key=lambda u: (-u[0], u[1])):
+    urgent = {sid for pri, sid, _ in ups if pri >= 3.0}
+    for pri, sid, up in sorted(ups, key=lambda u: (-u[0], u[1])):
         base = fitted.get(sid, 0.0)
         extra = up - base
-        if base > 0.0 and extra > 0.0 and alloc.headroom(sid) + ROW_TOL >= extra:
+        if base <= 0.0 or extra <= 0.0:
+            continue
+        if alloc.headroom(sid) + ROW_TOL >= extra or (
+            pri >= 3.0 and _make_room(sid, extra, fitted, alloc, controls, room_left, urgent)
+        ):
             fitted[sid] = up
             alloc.take(sid, extra)
     return fitted
+
+
+def _make_room(
+    sid: str,
+    extra: float,
+    fitted: Setpoints,
+    alloc: Allocation,
+    controls: Mapping[str, Control],
+    room_left: Callable[[str, float], float],
+    urgent: set[str],
+) -> bool:
+    """Lower one flexible session by one step if that lets ``sid`` rise by ``extra``.
+
+    Only sessions that could still make up one more step later qualify.
+    """
+    candidates = sorted(
+        (c for c in fitted if c != sid and c not in urgent),
+        key=lambda c: (-room_left(c, fitted[c]), c),
+    )
+    for c in candidates:
+        ctl = controls[c]
+        if ctl.step <= 0.0 or fitted[c] - ctl.step + POWER_TOL_KW < ctl.charge_min:
+            continue
+        if room_left(c, fitted[c] - ctl.step) + FINISH_TOL < 0.0:
+            continue
+        alloc.take(c, -ctl.step)
+        if alloc.headroom(sid) + ROW_TOL >= extra:
+            fitted[c] = round(fitted[c] - ctl.step, 9)
+            return True
+        alloc.take(c, ctl.step)
+    return False

@@ -13,7 +13,7 @@ current is feasible (the scenario validates that).
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -158,3 +158,48 @@ def fit_to_rows(
                 del x[sid]
             else:
                 x[sid] = v
+
+
+def trim_to_rows(
+    setpoints: Mapping[str, float],
+    constraints: StepConstraints,
+    controls: Mapping[str, Control],
+    *,
+    rank: Callable[[str, float], float] | None = None,
+    tol: float = ROW_TOL,
+) -> dict[str, float]:
+    """Lower setpoints just enough that every row holds, most flexible first.
+
+    Unlike :func:`fit_to_rows`, which scales every contributor to a violated
+    row (and so pauses everyone near the minimum), this takes the excess from
+    one setpoint at a time: the contributor with the highest
+    ``rank(session_id, current_setpoint)`` (default 0) and then the largest
+    margin above its minimum is lowered by the fewest resolution steps that
+    clear the excess, never below its minimum. Only when every contributor is
+    at its minimum is one paused. Every iteration lowers or pauses a setpoint,
+    so this terminates.
+    """
+    x = {sid: v for sid, v in setpoints.items() if v}
+
+    def key(sid: str) -> tuple[float, float, str]:
+        r = 0.0 if rank is None else rank(sid, x[sid])
+        return (-r, -(x[sid] - controls[sid].charge_min), sid)
+
+    while True:
+        usage = constraints.usage(x)
+        excess = usage - constraints.rhs
+        if not excess.size:
+            return x
+        r = int(np.argmax(excess))
+        if excess[r] <= tol:
+            return x
+        contributors = [sid for sid in x if constraints.coefficient(sid)[r] > 0]
+        margin = [sid for sid in contributors if x[sid] - controls[sid].charge_min > tol]
+        if not margin:
+            del x[min(contributors, key=key)]
+            continue
+        sid = min(margin, key=key)
+        ctl = controls[sid]
+        need = float(excess[r]) / float(constraints.coefficient(sid)[r])
+        cut = min(x[sid] - ctl.charge_min, ctl.snap_up(need))
+        x[sid] = max(ctl.charge_min, round(x[sid] - cut, 9))

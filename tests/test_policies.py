@@ -3,9 +3,10 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from evcharge.capacity import StepConstraints
 from evcharge.electrical import Supply
 from evcharge.metrics import compute_metrics
-from evcharge.model import Charger, Session
+from evcharge.model import Charger, Control, Session
 from evcharge.optim import relaxation_bound
 from evcharge.policies import (
     POLICY_FACTORIES,
@@ -19,7 +20,7 @@ from evcharge.policies import (
     Uncontrolled,
     make_policy,
 )
-from evcharge.policies.base import SessionState, priority_fill, water_fill
+from evcharge.policies.base import Observation, SessionState, finalize, priority_fill, water_fill
 from evcharge.sim import simulate
 
 from .helpers import make_scenario, session
@@ -390,3 +391,63 @@ def test_kw_model_is_the_phase_model_with_idle_lines(seed: int) -> None:
     simulate(aggregate, exact_kw)
     assert exact_phase.solution.objective == pytest.approx(exact_kw.solution.objective, rel=1e-5)
     assert simulate(phase, ModelPredictiveControl()).violations == ()
+
+
+def amp_state(
+    sid: str, remaining_kwh: float, steps_left: int, *, step: float = 1.0, k: float = 0.23
+) -> SessionState:
+    return SessionState(
+        session=session(sid, "C1", 0, steps_left, max(remaining_kwh, 1e-3), max_kw=7.4),
+        delivered_kwh=0.0,
+        p_min_kw=6 * k,
+        p_max_kw=32 * k,
+        steps_left=steps_left,
+        dt_h=1.0,
+        control_spec=Control("A", k, 6.0, 32.0, step),
+    )
+
+
+def amp_obs(states: list[SessionState], line_a: float) -> Observation:
+    rows = StepConstraints(
+        ("L1 import",), ("line",), np.array([line_a]), {st.id: np.ones(1) for st in states}
+    )
+    return Observation(0, tuple(states), 100.0, 0.0, rows)
+
+
+def test_finalize_rounds_to_grid_and_respects_rows() -> None:
+    a, b = amp_state("A", 10.0, 4), amp_state("B", 10.0, 4)
+    # nearest: 7.6 -> 8 fits; 7.2 -> 7 (remainder below one half)
+    assert finalize(amp_obs([a, b], 30.0), {"A": 7.6, "B": 7.2}) == {"A": 8.0, "B": 7.0}
+    # rows win over rounding: only 15 A are available
+    assert finalize(amp_obs([a, b], 15.0), {"A": 7.6, "B": 7.4}) == {"A": 8.0, "B": 7.0}
+    # below the 6 A minimum after rounding: paused
+    assert finalize(amp_obs([a], 30.0), {"A": 5.4}) == {}
+
+
+def test_finalize_gives_the_last_step_priority() -> None:
+    # 49 A on the line; three sessions whose continuous setpoints sum to 48.45 A all
+    # finish now, but only the last-step one cannot finish later.
+    early = amp_state("A", 20.768 * 0.23, 2)
+    other = amp_state("B", 12.154 * 0.23, 7)
+    last = amp_state("Z", 15.531 * 0.23, 1)
+    out = finalize(amp_obs([early, other, last], 49.0), {"A": 20.768, "B": 12.154, "Z": 15.531})
+    assert out["Z"] == 16.0  # rounded up: it finishes in its last step
+    assert sum(out.values()) <= 49.0 + 1e-9
+
+
+def test_finalize_makes_room_for_an_urgent_round_up() -> None:
+    # Z must round 15.5 -> 16 in its last step; the line is full after flooring,
+    # so the flexible session A gives up one ampere (it has later steps).
+    flexible = amp_state("A", 30.0, 6)
+    last = amp_state("Z", 15.5 * 0.23, 1)
+    out = finalize(amp_obs([flexible, last], 30.0), {"A": 15.0, "Z": 15.5}, room_later={"A": 60.0})
+    assert out == {"A": 14.0, "Z": 16.0}
+
+
+def test_finalize_is_the_identity_on_continuous_kw_setpoints() -> None:
+    st = state("A", 40.0, p_min=4.14)
+    obs = Observation(0, (st,), 20.0, 0.0)
+    assert finalize(obs, {"A": 7.123456}) == {"A": 7.123456}
+    # solver noise just under the minimum is lifted to it; far below pauses
+    assert finalize(obs, {"A": 4.14 - 1e-8}) == {"A": 4.14}
+    assert finalize(obs, {"A": 3.0}) == {}

@@ -297,3 +297,15 @@ def test_relaxation_bounds_every_policy_on_phase_sites(sc: Scenario) -> None:
     for policy in all_policies():
         m = compute_metrics(simulate(sc, policy))  # type: ignore[arg-type]
         assert bound <= m.penalised_cost_eur + cost_tol(bound), policy
+
+
+@PROPERTY_SETTINGS
+@given(phase_scenarios())
+def test_optimal_plan_bounds_its_replay_on_phase_sites(sc: Scenario) -> None:
+    # The rounded plan is on the chargers' grid, so the replay executes it exactly
+    # (up to the EV stopping when full), and line rows floored to the grid keep
+    # the LP a valid bound for every executable schedule.
+    opt = OptimalSchedule()
+    executed = compute_metrics(simulate(sc, opt)).penalised_cost_eur
+    assert relaxation_bound(sc) <= executed + cost_tol(executed)
+    assert executed <= opt.solution.objective + cost_tol(executed)

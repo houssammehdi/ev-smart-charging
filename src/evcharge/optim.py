@@ -38,7 +38,7 @@ the plan is replayed, and the LP relaxation (no overshoot) is a lower bound.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 
 import numpy as np
@@ -46,7 +46,7 @@ import numpy.typing as npt
 from scipy.optimize import Bounds, LinearConstraint, linprog, milp
 from scipy.sparse import coo_matrix, csr_matrix, hstack, vstack
 
-from evcharge.model import POWER_TOL_KW, FloatArray, RowModel, Scenario
+from evcharge.model import POWER_TOL_KW, FloatArray, RowModel, Scenario, on_grid
 
 DEFAULT_UNMET_PENALTY_EUR_PER_KWH = 100.0
 """Penalty on undelivered energy. It must exceed the marginal cost of delivering
@@ -99,6 +99,9 @@ class FlexLoad:
         efficiency: Grid-to-battery efficiency.
         rows: Coefficient of the setpoint in every constraint row of the
             problem (``None``: 1 on every row, the aggregate model).
+        step: Setpoint resolution (0: continuous); ``charge_min`` and
+            ``charge_max`` must be multiples of it. Used by
+            ``solve_schedule(..., round_to_grid=True)``.
     """
 
     id: str
@@ -110,6 +113,7 @@ class FlexLoad:
     kw_per_unit: float = 1.0
     efficiency: float = 1.0
     rows: tuple[float, ...] | None = None
+    step: float = 0.0
 
     @classmethod
     def from_lp_session(cls, s: LPSession) -> FlexLoad:
@@ -184,6 +188,8 @@ class ScheduleSolution:
         solve_time_s: Wall-clock time spent in the solver(s).
         setpoint: Commanded setpoints in each session's unit (equal to
             ``power_kw`` for kW setpoints).
+        n_rounding: Integer variables of the rounding stage
+            (``round_to_grid=True``), 0 otherwise.
     """
 
     power_kw: FloatArray
@@ -197,12 +203,26 @@ class ScheduleSolution:
     n_binaries: int
     solve_time_s: float
     setpoint: FloatArray
+    n_rounding: int = 0
 
     @property
     def gap(self) -> float:
         """Relative gap between :attr:`objective` and :attr:`lower_bound`."""
         return max(0.0, self.objective - self.lower_bound) / max(1e-9, abs(self.objective))
 
+
+ROUNDING_WINDOWS = (1, 0)
+"""Neighbourhoods tried by the rounding stage: a setpoint may move to grid values
+within this many steps beyond its floor or ceiling (1 first, then plain
+floor-or-ceiling if HiGHS finds no incumbent in time)."""
+
+ROUNDING_MIP_GAP = 0.01
+"""Relative gap at which the rounding MILP stops. A gap (not a time limit) keeps
+the result independent of machine speed; 1 % of the objective is well below
+the resolution effects the stage removes."""
+
+DEFAULT_ROUNDING_TIME_LIMIT_S = 60.0
+"""Safety time limit of each rounding MILP (the gap normally stops it in seconds)."""
 
 NUMERIC_ZERO = 1e-9
 """Coefficients smaller than this in magnitude are treated as exactly zero.
@@ -214,6 +234,16 @@ price of 1e-308); snapping them to zero changes the objective by a negligible am
 
 def _snap(values: FloatArray) -> FloatArray:
     return np.where(np.abs(values) < NUMERIC_ZERO, 0.0, values)
+
+
+def _grid_floor(values: FloatArray, step: FloatArray) -> FloatArray:
+    safe = np.where(step > 0.0, step, 1.0)
+    return np.asarray(step * np.floor(values / safe + 1e-6), dtype=np.float64)
+
+
+def _grid_ceil(values: FloatArray, step: FloatArray) -> FloatArray:
+    safe = np.where(step > 0.0, step, 1.0)
+    return np.asarray(step * np.ceil(values / safe - 1e-6), dtype=np.float64)
 
 
 def _milp_bound(res: object) -> float:
@@ -246,7 +276,33 @@ def _flex_loads(problem: ScheduleProblem) -> tuple[list[FlexLoad], FloatArray, i
             raise ValueError(f"session {s.id}: {len(s.rows)} row coefficients for {n_rows} rows")
         if s.rows is None and n_rows != 1:
             raise ValueError(f"session {s.id}: row coefficients are required with {n_rows} rows")
+    if problem.rows is not None:
+        rhs = _floor_line_rows(rhs, problem.rows.kinds, loads)
     return loads, rhs, n_rows
+
+
+def _floor_line_rows(rhs: FloatArray, kinds: tuple[str, ...], loads: list[FlexLoad]) -> FloatArray:
+    """Round line rows down to the setpoint grid of the sessions that load them.
+
+    A line row sums per-phase currents with coefficients 0 or 1. If every
+    session on the row has a resolution, the left-hand side of any executable
+    schedule is a multiple of the finest one, so rounding the right-hand side
+    down to that grid removes no executable schedule; it only tightens the LP
+    (whose bound therefore stays valid) and keeps plans away from capacity no
+    grid schedule can use.
+    """
+    out = rhs.copy()
+    for r, kind in enumerate(kinds):
+        if kind != "line":
+            continue
+        on_row = [s for s in loads if s.rows is not None and s.rows[r] != 0.0]
+        if not on_row or any(s.step <= 0.0 or s.rows[r] != 1.0 for s in on_row if s.rows):
+            continue
+        grid = min(s.step for s in on_row)
+        if any(not on_grid(s.step, grid) for s in on_row):
+            continue
+        out[:, r] = grid * np.floor(out[:, r] / grid + 1e-6)
+    return out
 
 
 class _Model:
@@ -270,6 +326,7 @@ class _Model:
         self.p_sess, self.p_time = p_sess, p_time
         c_min = np.array([s.charge_min for s in sessions], dtype=np.float64)
         self.p_max = np.array([s.charge_max for s in sessions], dtype=np.float64)[p_sess]
+        self.step = np.array([s.step for s in sessions], dtype=np.float64)[p_sess]
         unit_kw = np.array([s.kw_per_unit for s in sessions], dtype=np.float64)
         self.unit_kw = unit_kw
         k = unit_kw[p_sess]
@@ -444,6 +501,104 @@ class _Model:
             "optimal" if res.status == 0 else "time_limit",
         )
 
+    def round_to_grid(
+        self, x: FloatArray, *, time_limit_s: float | None, mip_rel_gap: float
+    ) -> tuple[FloatArray, float, str, int]:
+        """Put every setpoint with a resolution on its grid, optimally near ``x``.
+
+        ``x`` must already satisfy the minimum-current rule. Every setpoint that
+        is on and has a resolution may move to a grid value within one step of
+        its floor or ceiling (never outside its range): ``lo + step * n`` with
+        integer ``n``; setpoints that are off stay off and continuous setpoints
+        keep their on/off state. All rows, energy balances and the objective are
+        unchanged, so the result is the cheapest grid schedule in that
+        neighbourhood. If HiGHS returns no incumbent in the time limit, the
+        plain floor-or-ceiling neighbourhood is tried, and as a last resort
+        every setpoint is rounded down, which is always feasible (unmet energy
+        is a slack).
+
+        Returns ``(x, objective, status, n_integer_variables)``.
+        """
+        for window in ROUNDING_WINDOWS:
+            found = self._round_window(x, window, time_limit_s, mip_rel_gap)
+            if found is not None:
+                return found
+        p = x[: self.n_p]
+        floor = np.where(self.step > 0.0, _grid_floor(p, self.step), p)
+        on = p > POWER_TOL_KW
+        p_lb = np.where(on, np.maximum(floor, self.p_min), 0.0)
+        p_ub = np.where(on, np.maximum(floor, self.p_min), 0.0)
+        cont = (self.step <= 0.0) & (on | (self.p_min <= POWER_TOL_KW))
+        p_ub[cont] = self.p_max[cont]
+        x_lp, obj, _, _ = self.solve(
+            p_lb, p_ub, np.zeros(0, np.int64), time_limit_s=None, mip_rel_gap=mip_rel_gap
+        )
+        return x_lp, obj, "time_limit", 0
+
+    def _round_window(
+        self, x: FloatArray, window: int, time_limit_s: float | None, mip_rel_gap: float
+    ) -> tuple[FloatArray, float, str, int] | None:
+        p = x[: self.n_p]
+        step = self.step
+        quantized = step > 0.0
+        on = p > POWER_TOL_KW
+        lo = np.where(quantized, _grid_floor(p, step) - window * step, p)
+        hi = np.where(quantized, _grid_ceil(p, step) + window * step, p)
+        lo = np.maximum(lo, self.p_min)
+        hi = np.minimum(hi, self.p_max)
+        p_lb = np.where(quantized, lo, np.where(on, self.p_min, 0.0))
+        p_ub = np.where(quantized, hi, np.where(on | (self.p_min <= POWER_TOL_KW), self.p_max, 0.0))
+        p_lb[~on] = 0.0
+        p_ub[quantized & ~on] = 0.0
+        var = np.flatnonzero(quantized & on & (hi - lo > POWER_TOL_KW))
+        lb = self.lb.copy()
+        ub = self.ub.copy()
+        lb[: self.n_p] = p_lb
+        ub[: self.n_p] = p_ub
+        n_z = int(var.size)
+        if n_z == 0:
+            x_lp, obj, _, status = self.solve(
+                p_lb, p_ub, np.zeros(0, np.int64), time_limit_s=None, mip_rel_gap=mip_rel_gap
+            )
+            return x_lp, obj, status, 0
+        # x_j - step_j n_j = lo_j with integer n_j in [0, (hi_j - lo_j) / step_j]
+        z_cols = self.n_cont + np.arange(n_z)
+        z_rows = np.arange(n_z)
+        link = coo_matrix(
+            (
+                np.concatenate([np.ones(n_z), -step[var]]),
+                (np.concatenate([z_rows, z_rows]), np.concatenate([var, z_cols])),
+            ),
+            shape=(n_z, self.n_cont + n_z),
+        )
+        a_eq = vstack([hstack([self.a_eq, csr_matrix((self.a_eq.shape[0], n_z))]), link]).tocsr()
+        b_eq = np.concatenate([self.b_eq, lo[var]])
+        a_ub = hstack([self.a_ub, csr_matrix((self.a_ub.shape[0], n_z))]).tocsr()
+        n_max = np.round((hi[var] - lo[var]) / step[var])
+        options: dict[str, float | bool] = {
+            "disp": False,
+            "presolve": False,
+            "mip_rel_gap": mip_rel_gap,
+        }
+        if time_limit_s is not None:
+            options["time_limit"] = time_limit_s
+        res = milp(
+            np.concatenate([self.c, np.zeros(n_z)]),
+            constraints=[
+                LinearConstraint(a_eq, b_eq, b_eq),
+                LinearConstraint(a_ub, -np.inf, self.b_ub),
+            ],
+            integrality=np.concatenate([np.zeros(self.n_cont), np.ones(n_z)]),
+            bounds=Bounds(np.concatenate([lb, np.zeros(n_z)]), np.concatenate([ub, n_max])),
+            options=options,
+        )
+        if res.x is None or res.status not in (0, 1):
+            return None
+        xr = np.asarray(res.x, dtype=np.float64)
+        xr[var] = lo[var] + step[var] * np.round(xr[self.n_cont :])
+        status = "optimal" if res.status == 0 else "time_limit"
+        return xr[: self.n_cont], float(res.fun), status, n_z
+
     def to_solution(
         self, x: FloatArray, objective: float, bound: float, status: str, n_y: int, elapsed: float
     ) -> ScheduleSolution:
@@ -472,6 +627,8 @@ def solve_schedule(
     strategy: Strategy = "exact",
     time_limit_s: float | None = None,
     mip_rel_gap: float = 1e-6,
+    round_to_grid: bool = False,
+    rounding_time_limit_s: float | None = DEFAULT_ROUNDING_TIME_LIMIT_S,
 ) -> ScheduleSolution:
     """Solve the charging LP/MILP with HiGHS.
 
@@ -487,6 +644,11 @@ def solve_schedule(
             gives a certified :attr:`ScheduleSolution.lower_bound`.
         time_limit_s: HiGHS time limit for MILP solves.
         mip_rel_gap: Relative MIP gap at which HiGHS stops.
+        round_to_grid: Afterwards put every setpoint of a session with a
+            resolution (:attr:`FlexLoad.step`) on its grid with a rounding
+            MILP (see :meth:`_Model.round_to_grid`).
+        rounding_time_limit_s: Safety time limit of each rounding MILP; it
+            normally stops at :data:`ROUNDING_MIP_GAP`.
 
     Raises:
         SolverError: if HiGHS reports failure or returns no solution.
@@ -500,25 +662,30 @@ def solve_schedule(
         x, obj, bound, status = model.solve(
             p_lb, p_ub, eligible, time_limit_s=time_limit_s, mip_rel_gap=mip_rel_gap
         )
-        return model.to_solution(
-            x, obj, bound, status, int(eligible.size), time.perf_counter() - started
+        n_y = int(eligible.size)
+    else:
+        x_lp, bound, _, _ = model.solve(
+            p_lb, p_ub, np.zeros(0, np.int64), time_limit_s=None, mip_rel_gap=mip_rel_gap
         )
-
-    x_lp, bound, _, _ = model.solve(
-        p_lb, p_ub, np.zeros(0, np.int64), time_limit_s=None, mip_rel_gap=mip_rel_gap
-    )
-    p_lp = x_lp[: model.n_p][eligible]
-    off = p_lp <= POWER_TOL_KW
-    on = p_lp >= model.p_min[eligible] - POWER_TOL_KW
-    p_ub[eligible[off]] = 0.0
-    p_lb[eligible[on]] = model.p_min[eligible[on]]
-    fractional = eligible[~off & ~on]
-    x, obj, _, status = model.solve(
-        p_lb, p_ub, fractional, time_limit_s=time_limit_s, mip_rel_gap=mip_rel_gap
-    )
-    return model.to_solution(
-        x, obj, bound, status, int(fractional.size), time.perf_counter() - started
-    )
+        p_lp = x_lp[: model.n_p][eligible]
+        off = p_lp <= POWER_TOL_KW
+        on = p_lp >= model.p_min[eligible] - POWER_TOL_KW
+        p_ub[eligible[off]] = 0.0
+        p_lb[eligible[on]] = model.p_min[eligible[on]]
+        fractional = eligible[~off & ~on]
+        x, obj, _, status = model.solve(
+            p_lb, p_ub, fractional, time_limit_s=time_limit_s, mip_rel_gap=mip_rel_gap
+        )
+        n_y = int(fractional.size)
+    n_z = 0
+    if round_to_grid and np.any(model.step > 0.0):
+        x, obj, round_status, n_z = model.round_to_grid(
+            x, time_limit_s=rounding_time_limit_s, mip_rel_gap=ROUNDING_MIP_GAP
+        )
+        if round_status != "optimal":
+            status = round_status
+    solution = model.to_solution(x, obj, bound, status, n_y, time.perf_counter() - started)
+    return replace(solution, n_rounding=n_z)
 
 
 def flex_loads_from_scenario(scenario: Scenario) -> tuple[FlexLoad, ...]:
@@ -537,6 +704,7 @@ def flex_loads_from_scenario(scenario: Scenario) -> tuple[FlexLoad, ...]:
                 kw_per_unit=ctl.kw_per_unit,
                 efficiency=s.efficiency,
                 rows=tuple(float(a) for a in scenario.row_coefficients(s)),
+                step=ctl.step,
             )
         )
     return tuple(loads)
