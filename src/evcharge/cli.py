@@ -42,6 +42,29 @@ def _add_scenario_args(p: argparse.ArgumentParser) -> None:
         default=DEFAULT_DEMAND_CHARGE_EUR_PER_KW,
         help=f"EUR per kW of peak import (default {DEFAULT_DEMAND_CHARGE_EUR_PER_KW})",
     )
+    g.add_argument(
+        "--grid",
+        choices=["TN", "IT"],
+        default=None,
+        help="phase-aware site on a TN or IT grid (default: aggregate kW model)",
+    )
+    g.add_argument(
+        "--line-limit",
+        type=float,
+        default=None,
+        help="main fuse per line in A (default: the balanced equivalent of --grid-limit)",
+    )
+    g.add_argument(
+        "--no-rotation",
+        action="store_true",
+        help="install every charger L1L2L3 instead of rotating phases",
+    )
+    g.add_argument(
+        "--single-phase-share",
+        type=float,
+        default=None,
+        help="share of single-phase EVs on phase-aware sites (default: per profile)",
+    )
 
 
 def _add_policy_args(p: argparse.ArgumentParser, default: Sequence[str]) -> None:
@@ -100,6 +123,10 @@ def _scenario_from_args(args: argparse.Namespace) -> Scenario:
         pv_kwp=args.pv_kwp,
         base_load_peak_kw=args.base_load_peak,
         demand_charge_eur_per_kw=args.demand_charge,
+        grid=args.grid,
+        line_limit_a=args.line_limit,
+        rotate_phases=not args.no_rotation,
+        single_phase_share=args.single_phase_share,
     )
 
 
@@ -107,8 +134,11 @@ def _policies(names: Sequence[str]) -> list[Policy]:
     return [make_policy(n) for n in names]
 
 
-def _finite_or_none(value: float) -> float | None:
-    return value if math.isfinite(value) else None
+def _json_value(value: float | int | str) -> float | int | str | None:
+    """JSON has no NaN or infinity: map them to ``null``."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
 
 
 def _print_comparison(comparison: Comparison, fmt: str) -> None:
@@ -117,7 +147,10 @@ def _print_comparison(comparison: Comparison, fmt: str) -> None:
             "scenario": describe_scenario(comparison.scenario),
             "lower_bound_eur": comparison.lower_bound_eur,
             "results": [
-                {**m.as_dict(), "gap_pct": _finite_or_none(comparison.gap_pct(m))}
+                {
+                    **{k: _json_value(v) for k, v in m.as_dict().items()},
+                    "gap_pct": _json_value(comparison.gap_pct(m)),
+                }
                 for m in comparison.metrics
             ],
         }

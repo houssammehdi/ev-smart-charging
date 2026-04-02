@@ -253,10 +253,12 @@ class Charger:
         id: Unique charger identifier.
         max_power_kw: Maximum charger power.
         min_power_kw: Lowest non-zero power the charger can signal on an
-            aggregate site. The default is the IEC 61851 minimum of 6 A for a
-            *three-phase* EV (about 4.14 kW); give single-phase EVs their own
-            ``Session.min_power_kw`` (1.38 kW) or use a phase-aware site, where
-            the minimum is a current. Use 0 for continuously adjustable chargers.
+            aggregate site. The default is the IEC 61851 minimum of 6 A at the
+            charger's phase count: about 4.14 kW for three-phase and 1.38 kW for
+            single-phase chargers. A single-phase EV on a three-phase charger needs
+            its own ``Session.min_power_kw`` (1.38 kW), or use a phase-aware site,
+            where the minimum is a current. Use 0 for continuously adjustable
+            chargers.
         phases: Phases the charger provides (1 or 3; phase-aware sites only).
         rotation: Site line of each charger conductor, e.g. ``"L2L3L1"``
             (``None``: identity). Single-phase chargers name one line on TN and two
@@ -280,6 +282,9 @@ class Charger:
         if not self.id:
             raise ValidationError("charger id must be a non-empty string")
         where = f"charger {self.id}"
+        if self.phases == 1 and self.min_power_kw == MIN_POWER_3PH_KW:
+            # the default is 6 A on three phases; on one phase 6 A is 1.38 kW
+            object.__setattr__(self, "min_power_kw", MIN_POWER_1PH_KW)
         _require_finite(f"{where}: max_power_kw", self.max_power_kw)
         _require_finite(f"{where}: min_power_kw", self.min_power_kw)
         if self.max_power_kw <= 0:
@@ -793,6 +798,44 @@ class Scenario:
     def without_sessions(self) -> Scenario:
         """Copy of the scenario with sessions removed (what an online policy may know)."""
         return self.with_sessions(())
+
+    def aggregate(self) -> Scenario:
+        """The kW-only view of a phase-aware scenario.
+
+        Lines are dropped; every session keeps its power range
+        (:meth:`power_bounds`) as kW limits and the site keeps its kW limit. This
+        is what a controller that ignores phases believes the site to be.
+        Aggregate scenarios are returned unchanged.
+        """
+        if self.site.supply is None:
+            return self
+        chargers = tuple(
+            Charger(c.id, c.max_power_kw, 0.0, current_step_a=0.0) for c in self.site.chargers
+        )
+        sessions = []
+        for s in self.sessions:
+            p_min, p_max = self.power_bounds(s)
+            sessions.append(
+                Session(
+                    id=s.id,
+                    charger_id=s.charger_id,
+                    arrival_step=s.arrival_step,
+                    departure_step=s.departure_step,
+                    energy_kwh=s.energy_kwh,
+                    max_power_kw=p_max,
+                    efficiency=s.efficiency,
+                    min_power_kw=p_min,
+                )
+            )
+        return Scenario(
+            name=self.name,
+            horizon=self.horizon,
+            site=Site(self.site.grid_limit_kw, chargers),
+            tariff=self.tariff,
+            sessions=tuple(sessions),
+            base_load_kw=self.base_load,
+            pv_kw=self.pv,
+        )
 
     def with_sessions(self, sessions: tuple[Session, ...]) -> Scenario:
         """Copy of the scenario with a different set of sessions."""

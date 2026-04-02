@@ -52,6 +52,10 @@ def describe_scenario(scenario: Scenario) -> str:
     """One-line summary of a scenario."""
     hz = scenario.horizon
     extras = []
+    supply = scenario.site.supply
+    if supply is not None:
+        limits = "/".join(f"{v:.0f}" if v == round(v) else f"{v:.1f}" for v in supply.line_limit_a)
+        extras.append(f"{supply.grid.value} {limits} A per line")
     if scenario.pv.max() > 0:
         extras.append(f"PV peak {scenario.pv.max():.1f} kW")
     if scenario.base_load.max() > 0:
@@ -87,10 +91,16 @@ def format_table(comparison: Comparison) -> str:
     """Render the comparison as an aligned plain-text table.
 
     ``gap %`` is the penalised cost (total cost plus the unmet-energy penalty)
-    above the LP-relaxation lower bound.
+    above the LP-relaxation lower bound. Phase-aware scenarios get a ``line %``
+    column: the highest line current relative to its limit.
     """
-    rows = [
-        [
+    columns = list(_COLUMNS)
+    phase = comparison.scenario.site.phase_aware
+    if phase:
+        columns.insert(len(columns) - 1, ("line %", ">"))
+    rows = []
+    for m in comparison.metrics:
+        row = [
             m.policy,
             f"{m.delivered_pct:.2f}",
             f"{m.unmet_kwh:.2f}",
@@ -104,15 +114,14 @@ def format_table(comparison: Comparison) -> str:
             f"{m.capacity_utilisation_pct:.1f}",
             str(m.violations),
         ]
-        for m in comparison.metrics
-    ]
-    headers = [name for name, _ in _COLUMNS]
+        if phase:
+            row.insert(len(row) - 1, f"{m.max_line_loading_pct:.1f}")
+        rows.append(row)
+    headers = [name for name, _ in columns]
     widths = [max(len(h), *(len(r[i]) for r in rows)) for i, h in enumerate(headers)]
 
     def line(cells: Sequence[str]) -> str:
-        parts = [
-            f"{c:{align}{w}}" for c, (_, align), w in zip(cells, _COLUMNS, widths, strict=True)
-        ]
+        parts = [f"{c:{align}{w}}" for c, (_, align), w in zip(cells, columns, widths, strict=True)]
         return "  ".join(parts).rstrip()
 
     out = [line(headers), line(["-" * w for w in widths])]

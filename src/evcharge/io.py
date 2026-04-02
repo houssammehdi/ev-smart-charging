@@ -38,7 +38,9 @@ from pathlib import Path
 
 import numpy as np
 
+from evcharge.electrical import LINES, NOMINAL_VOLTAGE_V, GridType, Supply, WiringError
 from evcharge.model import (
+    DEFAULT_CURRENT_STEP_A,
     MIN_POWER_3PH_KW,
     Charger,
     FloatArray,
@@ -119,6 +121,94 @@ def parse_series(value: object, horizon: Horizon, where: str) -> FloatArray:
     return np.repeat(np.asarray(values, dtype=np.float64), repeat)
 
 
+def _opt_num(obj: dict[str, object], key: str, where: str) -> float | None:
+    value = obj.get(key)
+    return None if value is None else _num(value, f"{where}.{key}")
+
+
+def _parse_supply(value: object) -> Supply:
+    obj = _obj(value, "site.supply")
+    raw = _get(obj, "line_limit_a", "site.supply")
+    if isinstance(raw, list):
+        if len(raw) != 3:
+            raise ValidationError("site.supply.line_limit_a: expected 3 values (L1, L2, L3)")
+        limits = tuple(_num(v, f"site.supply.line_limit_a[{i}]") for i, v in enumerate(raw))
+    else:
+        limits = (_num(raw, "site.supply.line_limit_a"),) * 3
+    grid = _str(obj.get("grid", "TN"), "site.supply.grid").upper()
+    if grid not in ("TN", "IT"):
+        raise ValidationError(f"site.supply.grid: expected 'TN' or 'IT', got {grid!r}")
+    try:
+        return Supply(
+            (limits[0], limits[1], limits[2]),
+            GridType(grid),
+            _num(obj.get("voltage_v", NOMINAL_VOLTAGE_V), "site.supply.voltage_v"),
+        )
+    except WiringError as exc:
+        raise ValidationError(f"site.supply: {exc}") from None
+
+
+def _parse_charger(raw: object, where: str, phase_aware: bool) -> Charger:
+    c = _obj(raw, where)
+    phases = _int(c.get("phases", 3), f"{where}.phases")
+    max_current = _opt_num(c, "max_current_a", where)
+    power = c.get("max_power_kw")
+    if power is None and phase_aware and max_current is not None:
+        max_power = phases * NOMINAL_VOLTAGE_V * max_current / 1000.0
+    else:
+        max_power = _num(_get(c, "max_power_kw", where), f"{where}.max_power_kw")
+    rotation = c.get("rotation")
+    try:
+        return Charger(
+            id=_str(_get(c, "id", where), f"{where}.id"),
+            max_power_kw=max_power,
+            min_power_kw=_num(c.get("min_power_kw", MIN_POWER_3PH_KW), f"{where}.min_power_kw"),
+            phases=phases,
+            rotation=None if rotation is None else _str(rotation, f"{where}.rotation"),
+            max_current_a=max_current,
+            min_current_a=_num(c.get("min_current_a", 6.0), f"{where}.min_current_a"),
+            current_step_a=_num(
+                c.get("current_step_a", DEFAULT_CURRENT_STEP_A), f"{where}.current_step_a"
+            ),
+        )
+    except ValidationError as exc:
+        raise ValidationError(f"{where}: {exc}") from None
+
+
+def _parse_session(raw: object, where: str, horizon: Horizon) -> Session:
+    s = _obj(raw, where)
+    arrival = _time(_get(s, "arrival", where), f"{where}.arrival")
+    departure = _time(_get(s, "departure", where), f"{where}.departure")
+    try:
+        return Session(
+            id=_str(_get(s, "id", where), f"{where}.id"),
+            charger_id=_str(_get(s, "charger", where), f"{where}.charger"),
+            arrival_step=max(0, horizon.step_at_or_after(arrival)),
+            departure_step=min(horizon.n_steps, horizon.step_at_or_before(departure)),
+            energy_kwh=_num(_get(s, "energy_kwh", where), f"{where}.energy_kwh"),
+            max_power_kw=_num(_get(s, "max_power_kw", where), f"{where}.max_power_kw"),
+            efficiency=_num(s.get("efficiency", 0.9), f"{where}.efficiency"),
+            min_power_kw=_opt_num(s, "min_power_kw", where),
+            phases=_int(s.get("phases", 3), f"{where}.phases"),
+            max_current_a=_opt_num(s, "max_current_a", where),
+        )
+    except ValidationError as exc:
+        raise ValidationError(f"{where}: {exc}") from None
+
+
+def _parse_line_series(value: object, horizon: Horizon, where: str) -> FloatArray:
+    obj = _obj(value, where)
+    unknown = sorted(set(obj) - set(LINES))
+    if unknown:
+        raise ValidationError(f"{where}: unknown line(s) {', '.join(unknown)}; use L1, L2, L3")
+    zero = np.zeros(horizon.n_steps)
+    columns = [
+        parse_series(obj[line], horizon, f"{where}.{line}") if line in obj else zero
+        for line in LINES
+    ]
+    return np.column_stack(columns)
+
+
 def scenario_from_dict(data: object) -> Scenario:
     """Build a validated :class:`Scenario` from parsed JSON."""
     root = _obj(data, "scenario")
@@ -130,24 +220,19 @@ def scenario_from_dict(data: object) -> Scenario:
     )
 
     site_obj = _obj(_get(root, "site", "scenario"), "site")
+    supply = None if site_obj.get("supply") is None else _parse_supply(site_obj["supply"])
     raw_chargers = _get(site_obj, "chargers", "site")
     if not isinstance(raw_chargers, list):
         raise ValidationError("site.chargers: expected a list")
-    chargers = []
-    for i, raw in enumerate(raw_chargers):
-        where = f"site.chargers[{i}]"
-        c = _obj(raw, where)
-        chargers.append(
-            Charger(
-                id=_str(_get(c, "id", where), f"{where}.id"),
-                max_power_kw=_num(_get(c, "max_power_kw", where), f"{where}.max_power_kw"),
-                min_power_kw=_num(c.get("min_power_kw", MIN_POWER_3PH_KW), f"{where}.min_power_kw"),
-            )
-        )
-    site = Site(
-        grid_limit_kw=_num(_get(site_obj, "grid_limit_kw", "site"), "site.grid_limit_kw"),
-        chargers=tuple(chargers),
+    chargers = tuple(
+        _parse_charger(raw, f"site.chargers[{i}]", supply is not None)
+        for i, raw in enumerate(raw_chargers)
     )
+    if site_obj.get("grid_limit_kw") is None and supply is not None:
+        grid_limit = supply.fuse_equivalent_kw
+    else:
+        grid_limit = _num(_get(site_obj, "grid_limit_kw", "site"), "site.grid_limit_kw")
+    site = Site(grid_limit_kw=grid_limit, chargers=chargers, supply=supply)
 
     tar = _obj(_get(root, "tariff", "scenario"), "tariff")
     export_raw = tar.get("export_price_eur_per_kwh")
@@ -166,43 +251,28 @@ def scenario_from_dict(data: object) -> Scenario:
     raw_sessions = _get(root, "sessions", "scenario")
     if not isinstance(raw_sessions, list):
         raise ValidationError("sessions: expected a list")
-    sessions = []
-    for i, raw in enumerate(raw_sessions):
-        where = f"sessions[{i}]"
-        s = _obj(raw, where)
-        arrival = _time(_get(s, "arrival", where), f"{where}.arrival")
-        departure = _time(_get(s, "departure", where), f"{where}.departure")
-        min_raw = s.get("min_power_kw")
-        try:
-            sessions.append(
-                Session(
-                    id=_str(_get(s, "id", where), f"{where}.id"),
-                    charger_id=_str(_get(s, "charger", where), f"{where}.charger"),
-                    arrival_step=max(0, horizon.step_at_or_after(arrival)),
-                    departure_step=min(horizon.n_steps, horizon.step_at_or_before(departure)),
-                    energy_kwh=_num(_get(s, "energy_kwh", where), f"{where}.energy_kwh"),
-                    max_power_kw=_num(_get(s, "max_power_kw", where), f"{where}.max_power_kw"),
-                    efficiency=_num(s.get("efficiency", 0.9), f"{where}.efficiency"),
-                    min_power_kw=None
-                    if min_raw is None
-                    else _num(min_raw, f"{where}.min_power_kw"),
-                )
-            )
-        except ValidationError as exc:
-            raise ValidationError(f"{where}: {exc}") from None
+    sessions = tuple(
+        _parse_session(raw, f"sessions[{i}]", horizon) for i, raw in enumerate(raw_sessions)
+    )
 
     def optional_series(key: str) -> FloatArray | None:
         raw = root.get(key)
         return None if raw is None else parse_series(raw, horizon, key)
+
+    def optional_lines(key: str) -> FloatArray | None:
+        raw = root.get(key)
+        return None if raw is None else _parse_line_series(raw, horizon, key)
 
     return Scenario(
         name=_str(root.get("name", "custom"), "name"),
         horizon=horizon,
         site=site,
         tariff=tariff,
-        sessions=tuple(sessions),
+        sessions=sessions,
         base_load_kw=optional_series("base_load_kw"),
         pv_kw=optional_series("pv_kw"),
+        base_current_a=optional_lines("base_current_a"),
+        pv_current_a=optional_lines("pv_current_a"),
     )
 
 

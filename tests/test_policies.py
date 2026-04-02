@@ -15,13 +15,14 @@ from evcharge.policies import (
     LeastLaxityFirst,
     ModelPredictiveControl,
     OptimalSchedule,
+    PhaseBlind,
     Policy,
     PriceAware,
     Uncontrolled,
     make_policy,
 )
 from evcharge.policies.base import Observation, SessionState, finalize, priority_fill, water_fill
-from evcharge.sim import simulate
+from evcharge.sim import ViolationKind, simulate
 
 from .helpers import make_scenario, session
 
@@ -451,3 +452,34 @@ def test_finalize_is_the_identity_on_continuous_kw_setpoints() -> None:
     # solver noise just under the minimum is lifted to it; far below pauses
     assert finalize(obs, {"A": 4.14 - 1e-8}) == {"A": 4.14}
     assert finalize(obs, {"A": 3.0}) == {}
+
+
+def test_phase_blind_controller_overloads_a_shared_line() -> None:
+    # Six single-phase 32 A EVs, all on L1 (no rotation), behind 3 x 63 A: the kW
+    # limit (fuse equivalent, 43.5 kW) looks fine, one line does not.
+    chargers = [Charger(f"C{i}", 7.4, phases=1, rotation="L1") for i in range(6)]
+    sessions = [Session(f"S{i}", f"C{i}", 0, 4, 20.0, 7.4, phases=1) for i in range(6)]
+    supply = Supply.uniform(63.0)
+    sc = make_scenario(
+        sessions, chargers=chargers, supply=supply, grid_limit_kw=supply.fuse_equivalent_kw
+    )
+    kw_view = sc.aggregate()
+    assert kw_view.site.supply is None
+    assert [kw_view.power_bounds(s) for s in kw_view.sessions] == [
+        sc.power_bounds(s) for s in sc.sessions
+    ]
+    # what the kW-only plan does to the lines, before any protection acts
+    plan = simulate(kw_view, LeastLaxityFirst())
+    ctl = sc.control(sc.sessions[0])
+    currents = sc.line_currents_a(plan.power_kw / ctl.kw_per_unit)
+    # the kW limit is 3 x 63 A x 230 V, and all of it lands on L1: three times its fuse
+    assert currents[0, 0] == pytest.approx(3 * 63.0)
+    # enforced on the phase-aware site: the simulator cuts L1 back to 63 A
+    blind = simulate(sc, PhaseBlind(LeastLaxityFirst()))
+    assert blind.policy_name == "llf (kW only)"
+    assert {v.kind for v in blind.violations} == {ViolationKind.LINE_LIMIT}
+    assert blind.line_current_a is not None
+    assert blind.line_current_a.max() <= 63.0 + 1e-9
+    aware = simulate(sc, LeastLaxityFirst())
+    assert aware.violations == ()
+    assert repr(PhaseBlind(LeastLaxityFirst())) == "PhaseBlind(LeastLaxityFirst())"

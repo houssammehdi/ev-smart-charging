@@ -1,0 +1,85 @@
+{
+  "name": "garage-it-example",
+  "horizon": {"start": "2026-11-10T12:00:00+01:00", "hours": 24, "step_minutes": 15},
+  "site": {
+    "grid_limit_kw": 40.0,
+    "supply": {"grid": "IT", "line_limit_a": 80, "voltage_v": 230},
+    "chargers": [
+      {"id": "P01", "phases": 3, "rotation": "L1L2L3", "max_current_a": 32, "current_step_a": 1},
+      {"id": "P02", "phases": 3, "rotation": "L2L3L1", "max_current_a": 32, "current_step_a": 1},
+      {"id": "P03", "phases": 3, "rotation": "L3L1L2", "max_current_a": 32, "current_step_a": 1},
+      {"id": "P04", "phases": 3, "rotation": "L1L2L3", "max_current_a": 32, "current_step_a": 1},
+      {"id": "P05", "phases": 3, "rotation": "L2L3L1", "max_current_a": 32, "current_step_a": 1},
+      {"id": "P06", "phases": 1, "rotation": "L3L1", "max_current_a": 16, "current_step_a": 1}
+    ]
+  },
+  "tariff": {
+    "price_eur_per_kwh": {
+      "resolution_minutes": 60,
+      "values": [
+        0.141, 0.139, 0.142, 0.151, 0.170, 0.196, 0.214, 0.205,
+        0.178, 0.152, 0.131, 0.118, 0.109, 0.104, 0.101, 0.100,
+        0.102, 0.108, 0.121, 0.138, 0.162, 0.180, 0.171, 0.153
+      ]
+    },
+    "export_price_eur_per_kwh": 0.0,
+    "demand_charge_eur_per_kw": 0.3
+  },
+  "base_load_kw": {
+    "resolution_minutes": 60,
+    "values": [
+      9.0, 9.2, 9.6, 10.5, 12.0, 14.5, 16.0, 15.5,
+      13.0, 11.0, 9.5, 8.5, 7.5, 7.0, 6.8, 6.8,
+      7.0, 8.0, 10.5, 12.0, 11.5, 10.5, 10.0, 9.5
+    ]
+  },
+  "base_current_a": {
+    "L1": {
+      "resolution_minutes": 60,
+      "values": [
+        26, 27, 28, 31, 35, 42, 46, 45, 38, 32, 28, 25,
+        22, 21, 20, 20, 21, 24, 31, 35, 34, 31, 29, 28
+      ]
+    },
+    "L2": {
+      "resolution_minutes": 60,
+      "values": [
+        20, 20, 21, 23, 26, 32, 35, 34, 29, 24, 21, 19,
+        17, 16, 15, 15, 16, 18, 23, 26, 25, 23, 22, 21
+      ]
+    },
+    "L3": {
+      "resolution_minutes": 60,
+      "values": [
+        22, 23, 24, 26, 30, 36, 40, 39, 33, 28, 24, 22,
+        19, 18, 17, 17, 18, 20, 26, 30, 29, 26, 25, 24
+      ]
+    }
+  },
+  "sessions": [
+    {"id": "EV-01", "charger": "P01", "arrival": "2026-11-10T16:40:00+01:00",
+     "departure": "2026-11-11T07:10:00+01:00", "energy_kwh": 24.0, "max_power_kw": 7.4,
+     "phases": 1, "max_current_a": 32, "efficiency": 0.9},
+    {"id": "EV-02", "charger": "P02", "arrival": "2026-11-10T17:05:00+01:00",
+     "departure": "2026-11-11T07:45:00+01:00", "energy_kwh": 30.0, "max_power_kw": 11.0,
+     "phases": 3, "max_current_a": 16, "efficiency": 0.92},
+    {"id": "EV-03", "charger": "P03", "arrival": "2026-11-10T17:30:00+01:00",
+     "departure": "2026-11-11T06:30:00+01:00", "energy_kwh": 18.0, "max_power_kw": 7.4,
+     "phases": 1, "max_current_a": 32, "efficiency": 0.9},
+    {"id": "EV-04", "charger": "P04", "arrival": "2026-11-10T18:10:00+01:00",
+     "departure": "2026-11-11T08:20:00+01:00", "energy_kwh": 12.0, "max_power_kw": 3.7,
+     "phases": 1, "max_current_a": 16, "efficiency": 0.88},
+    {"id": "EV-05", "charger": "P05", "arrival": "2026-11-10T19:20:00+01:00",
+     "departure": "2026-11-11T07:00:00+01:00", "energy_kwh": 35.0, "max_power_kw": 22.0,
+     "phases": 3, "max_current_a": 32, "efficiency": 0.93},
+    {"id": "EV-06", "charger": "P06", "arrival": "2026-11-10T20:00:00+01:00",
+     "departure": "2026-11-11T06:45:00+01:00", "energy_kwh": 14.0, "max_power_kw": 3.7,
+     "phases": 1, "max_current_a": 16, "efficiency": 0.9},
+    {"id": "EV-07", "charger": "P01", "arrival": "2026-11-11T07:30:00+01:00",
+     "departure": "2026-11-11T11:30:00+01:00", "energy_kwh": 6.0, "max_power_kw": 7.4,
+     "phases": 1, "max_current_a": 32, "efficiency": 0.9},
+    {"id": "EV-08", "charger": "P03", "arrival": "2026-11-10T12:30:00+01:00",
+     "departure": "2026-11-10T16:00:00+01:00", "energy_kwh": 8.0, "max_power_kw": 11.0,
+     "phases": 3, "max_current_a": 16, "efficiency": 0.91}
+  ]
+}

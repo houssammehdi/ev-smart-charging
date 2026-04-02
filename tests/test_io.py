@@ -106,3 +106,67 @@ def test_missing_fields_and_bad_json(tmp_path: Path) -> None:
     good = tmp_path / "good.json"
     good.write_text(json.dumps(base_doc()), encoding="utf-8")
     assert len(load_scenario(good).sessions) == 1
+
+
+GARAGE = Path(__file__).resolve().parents[1] / "examples" / "garage-it.json"
+
+
+def test_phase_aware_example_loads() -> None:
+    sc = load_scenario(GARAGE)
+    assert sc.site.supply is not None
+    assert sc.site.supply.grid.value == "IT"
+    assert sc.site.supply.line_limit_a == (80.0, 80.0, 80.0)
+    p06 = sc.site.charger("P06")
+    assert (p06.phases, p06.rotation, p06.current_step_a) == (1, "L3L1", 1.0)
+    assert p06.max_power_kw == pytest.approx(3.68)  # derived: 1 x 230 V x 16 A
+    ev6 = next(s for s in sc.sessions if s.id == "EV-06")
+    wires = sc.wiring(ev6)
+    assert wires is not None
+    assert wires.lines == (2, 0)  # line-to-line on L3-L1
+    assert sc.base_line_current_a[0].tolist() == [26.0, 20.0, 22.0]
+
+
+def phase_doc() -> dict[str, Any]:
+    doc = base_doc()
+    doc["site"]["supply"] = {"grid": "tn", "line_limit_a": [32, 25, 32]}
+    doc["site"]["chargers"][0].update({"phases": 3, "rotation": "STR", "max_current_a": 16})
+    doc["sessions"][0].update({"phases": 1, "max_current_a": 16})
+    return doc
+
+
+def test_phase_fields_and_defaults() -> None:
+    doc = phase_doc()
+    del doc["site"]["grid_limit_kw"]
+    doc["pv_current_a"] = {"L2": 3.0}
+    sc = scenario_from_dict(doc)
+    assert sc.site.supply is not None
+    assert sc.site.supply.line_limit_a == (32.0, 25.0, 32.0)
+    # without a kW limit the fuse-equivalent power applies: 3 x 230 V x 25 A
+    assert sc.site.grid_limit_kw == pytest.approx(17.25)
+    s = sc.sessions[0]
+    wires = sc.wiring(s)
+    assert wires is not None
+    assert wires.lines == (1,)  # STR puts the charger's first conductor on L2
+    assert sc.pv_line_current_a[0].tolist() == [0.0, 3.0, 0.0]
+
+
+@pytest.mark.parametrize(
+    ("path", "value", "match"),
+    [
+        (("site", "supply", "grid"), "TT", "'TN' or 'IT'"),
+        (("site", "supply", "line_limit_a"), [32, 32], "3 values"),
+        (("site", "supply", "line_limit_a"), -5, "site.supply"),
+        (("site", "chargers", 0, "rotation"), "L1L2", "charger C1"),
+        (("sessions", 0, "phases"), 4, r"sessions\[0\].*phases"),
+        (("base_current_a",), {"L4": 1.0}, "unknown line"),
+        (("base_current_a",), {"L1": 99.0}, "L1 limit"),
+    ],
+)
+def test_phase_errors_name_the_field(path: tuple[Any, ...], value: Any, match: str) -> None:
+    doc = phase_doc()
+    target: Any = doc
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = value
+    with pytest.raises(ValidationError, match=match):
+        scenario_from_dict(doc)

@@ -63,6 +63,9 @@ def test_horizon_validation() -> None:
 def test_charger_and_site_validation() -> None:
     with pytest.raises(ValidationError, match="min_power_kw"):
         Charger("C1", 3.0, 4.14)
+    # the default minimum is 6 A at the charger's phase count
+    assert Charger("C1", 3.68, phases=1).min_power_kw == pytest.approx(1.38)
+    assert Charger("C1", 11.0).min_power_kw == pytest.approx(4.14)
     with pytest.raises(ValidationError):
         Charger("", 11.0)
     with pytest.raises(ValidationError, match="duplicate"):

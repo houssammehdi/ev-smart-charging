@@ -14,6 +14,12 @@ The shapes are stylised but grounded in Nordic practice:
 * **Energy requests** are capped at 95 % of what the EV could take alone during
   its stay, so every session is individually feasible and unmet energy is
   caused by the shared grid limit, not by impossible requests.
+* **Phase-aware sites** (``grid="TN"`` or ``"IT"``) command chargers in amperes:
+  11 and 22 kW chargers are three-phase 16 and 32 A units, the 3.7 kW EVs are
+  single-phase 16 A cars, and the main fuse defaults to the current at which a
+  balanced load reaches the kW limit. Chargers are installed with cyclic phase
+  rotation unless ``rotate_phases=False``. All phase options are applied after
+  the random draws, so they never change the sessions' times or energies.
 """
 
 from __future__ import annotations
@@ -26,6 +32,15 @@ from typing import TypedDict, Unpack
 
 import numpy as np
 
+from evcharge.electrical import (
+    NOMINAL_VOLTAGE_V,
+    GridType,
+    Supply,
+    WiringError,
+    parse_rotation,
+    three_phase_kw_per_a,
+    wiring,
+)
 from evcharge.model import (
     MIN_POWER_1PH_KW,
     MIN_POWER_3PH_KW,
@@ -54,6 +69,12 @@ class _EVType:
     max_power_kw: float
     min_power_kw: float
     share: float
+    phases: int = 3
+    max_current_a: float = 16.0
+
+
+ROTATIONS = ("L1L2L3", "L2L3L1", "L3L1L2")
+"""Cyclic phase rotations used for the chargers of phase-aware scenarios."""
 
 
 def _bump(hours: FloatArray, centre: float, width: float) -> FloatArray:
@@ -126,9 +147,7 @@ def _base_load(
     return np.asarray(np.maximum(0.0, peak_kw * shape * (1.0 + noise)), dtype=np.float64)
 
 
-def _assign_chargers(
-    windows: list[tuple[int, int]], max_kw: float, min_kw: float
-) -> tuple[list[str], tuple[Charger, ...]]:
+def _assign_chargers(windows: list[tuple[int, int]]) -> tuple[list[str], int]:
     """Greedy interval colouring: reuse the first free charger, add one if none is free."""
     free_at: list[int] = []
     assignment = [""] * len(windows)
@@ -142,11 +161,29 @@ def _assign_chargers(
         else:
             free_at.append(departure)
             assignment[i] = f"CP{len(free_at):02d}"
-    chargers = tuple(
-        Charger(id=f"CP{c + 1:02d}", max_power_kw=max_kw, min_power_kw=min_kw)
-        for c in range(len(free_at))
+    return assignment, len(free_at)
+
+
+def _ev_mix(types: tuple[_EVType, ...], single_phase_share: float | None) -> tuple[_EVType, ...]:
+    """EV types with the single-phase share overridden (``None``: unchanged)."""
+    if single_phase_share is None:
+        return types
+    if not 0.0 <= single_phase_share <= 1.0:
+        raise ValidationError("single_phase_share must be in [0, 1]")
+    if not any(t.phases == 1 for t in types):
+        types = (*types, _SINGLE_PHASE_VAN)
+    shares = [0.0] * len(types)
+    for single, total in ((True, single_phase_share), (False, 1.0 - single_phase_share)):
+        group = [i for i, t in enumerate(types) if (t.phases == 1) == single]
+        weights = [types[i].share for i in group]
+        if sum(weights) == 0.0:
+            weights = [1.0] * len(group)
+        for i, w in zip(group, weights, strict=True):
+            shares[i] = total * w / sum(weights)
+    return tuple(
+        _EVType(t.max_power_kw, t.min_power_kw, shares[i], t.phases, t.max_current_a)
+        for i, t in enumerate(types)
     )
-    return assignment, chargers
 
 
 @dataclass(frozen=True)
@@ -182,10 +219,13 @@ def _overnight_departure(
 
 
 _EV_MIX_AC = (
-    _EVType(11.0, MIN_POWER_3PH_KW, 0.65),
-    _EVType(3.7, MIN_POWER_1PH_KW, 0.15),
-    _EVType(22.0, MIN_POWER_3PH_KW, 0.20),
+    _EVType(11.0, MIN_POWER_3PH_KW, 0.65, 3, 16.0),
+    _EVType(3.7, MIN_POWER_1PH_KW, 0.15, 1, 16.0),
+    _EVType(22.0, MIN_POWER_3PH_KW, 0.20, 3, 32.0),
 )
+
+_SINGLE_PHASE_VAN = _EVType(7.4, MIN_POWER_1PH_KW, 0.0, 1, 32.0)
+"""Added to profiles without a single-phase EV when ``single_phase_share`` is set."""
 
 PROFILES: dict[str, _Profile] = {
     "workplace": _Profile(
@@ -216,8 +256,8 @@ PROFILES: dict[str, _Profile] = {
         energy_clip=(15.0, 90.0),
         charger_kw=22.0,
         ev_types=(
-            _EVType(22.0, MIN_POWER_3PH_KW, 0.5),
-            _EVType(11.0, MIN_POWER_3PH_KW, 0.5),
+            _EVType(22.0, MIN_POWER_3PH_KW, 0.5, 3, 32.0),
+            _EVType(11.0, MIN_POWER_3PH_KW, 0.5, 3, 16.0),
         ),
         base_profile="depot",
         base_peak_per_session_kw=0.5,
@@ -253,6 +293,10 @@ def generate(
     pv_kwp: float = 0.0,
     base_load_peak_kw: float | None = None,
     demand_charge_eur_per_kw: float = DEFAULT_DEMAND_CHARGE_EUR_PER_KW,
+    grid: GridType | str | None = None,
+    line_limit_a: float | None = None,
+    rotate_phases: bool = True,
+    single_phase_share: float | None = None,
 ) -> Scenario:
     """Generate a synthetic scenario.
 
@@ -268,6 +312,13 @@ def generate(
         base_load_peak_kw: Peak of the non-EV base load; defaults to a
             per-profile kW per session.
         demand_charge_eur_per_kw: Demand charge on the horizon's peak import.
+        grid: ``"TN"`` or ``"IT"`` for a phase-aware site (``None``: aggregate kW model).
+        line_limit_a: Main fuse per line; defaults to the current at which a
+            balanced load reaches ``grid_limit_kw``.
+        rotate_phases: Install chargers with cyclic phase rotation
+            (``L1L2L3``, ``L2L3L1``, ``L3L1L2``) instead of all ``L1L2L3``.
+        single_phase_share: Override the share of single-phase EVs
+            (phase-aware sites only).
 
     Raises:
         ValidationError: for unknown kinds or invalid parameters.
@@ -278,7 +329,11 @@ def generate(
         raise ValidationError("n_sessions must be positive")
     if step_minutes <= 0 or 60 % step_minutes != 0:
         raise ValidationError("step_minutes must divide 60 (e.g. 5, 15, 30, 60)")
+    grid_type = None if grid is None else GridType(grid)
+    if grid_type is None and (line_limit_a is not None or single_phase_share is not None):
+        raise ValidationError("line_limit_a and single_phase_share need a phase-aware grid")
     prof = PROFILES[kind]
+    ev_types = _ev_mix(prof.ev_types, single_phase_share)
     rng = np.random.default_rng(seed)
     start = SCENARIO_DATE.replace(hour=prof.start_hour)
     horizon = Horizon.spanning(start, 24.0, step_minutes)
@@ -295,8 +350,8 @@ def generate(
         rng.lognormal(math.log(prof.energy_median_kwh), prof.energy_sigma, n_sessions),
         *prof.energy_clip,
     )
-    shares = np.array([t.share for t in prof.ev_types])
-    type_idx = rng.choice(len(prof.ev_types), size=n_sessions, p=shares / shares.sum())
+    shares = np.array([t.share for t in ev_types])
+    type_idx = rng.choice(len(ev_types), size=n_sessions, p=shares / shares.sum())
     efficiencies = rng.uniform(0.88, 0.94, n_sessions)
 
     windows: list[tuple[int, int]] = []
@@ -304,29 +359,81 @@ def generate(
         a = math.ceil(a_h * steps_per_hour - 1e-9)
         d = min(horizon.n_steps, math.floor(d_h * steps_per_hour + 1e-9))
         windows.append((a, max(d, a + 1)))
-    assignment, chargers = _assign_chargers(windows, prof.charger_kw, MIN_POWER_3PH_KW)
+    assignment, n_chargers = _assign_chargers(windows)
+
+    limit = grid_limit_kw if grid_limit_kw is not None else prof.grid_kw_per_session * n_sessions
+    # three-phase AC chargers: 11 kW is 16 A, 22 kW is 32 A per phase
+    charger_a = float(round(prof.charger_kw * 1000.0 / (3 * NOMINAL_VOLTAGE_V)))
+    rotations = [ROTATIONS[c % 3] if rotate_phases else ROTATIONS[0] for c in range(n_chargers)]
+    if grid_type is None:
+        chargers = tuple(
+            Charger(f"CP{c + 1:02d}", prof.charger_kw, MIN_POWER_3PH_KW) for c in range(n_chargers)
+        )
+        supply = None
+    else:
+        chargers = tuple(
+            Charger(
+                f"CP{c + 1:02d}",
+                3 * NOMINAL_VOLTAGE_V * charger_a / 1000.0,
+                phases=3,
+                rotation=rotations[c],
+                max_current_a=charger_a,
+            )
+            for c in range(n_chargers)
+        )
+        per_amp = three_phase_kw_per_a(grid_type, NOMINAL_VOLTAGE_V)
+        fuse = line_limit_a if line_limit_a is not None else limit / per_amp
+        supply = Supply.uniform(fuse, grid_type)
 
     sessions = []
     for i in range(n_sessions):
-        ev = prof.ev_types[int(type_idx[i])]
-        p_max = min(ev.max_power_kw, prof.charger_kw)
+        ev = ev_types[int(type_idx[i])]
         a, d = windows[i]
         eta = float(round(efficiencies[i], 3))
+        sid = f"{prof.label[:3].upper()}-{i + 1:03d}"
+        if grid_type is None:
+            p_max = min(ev.max_power_kw, prof.charger_kw)
+            feasible = 0.95 * p_max * eta * (d - a) * dt
+            sessions.append(
+                Session(
+                    id=sid,
+                    charger_id=assignment[i],
+                    arrival_step=a,
+                    departure_step=d,
+                    energy_kwh=float(round(min(float(energies[i]), feasible), 2)),
+                    max_power_kw=ev.max_power_kw,
+                    efficiency=eta,
+                    min_power_kw=ev.min_power_kw,
+                )
+            )
+            continue
+        charger_index = int(assignment[i][2:]) - 1
+        try:
+            wires = wiring(
+                grid_type,
+                NOMINAL_VOLTAGE_V,
+                3,
+                parse_rotation(rotations[charger_index], 3, grid_type),
+                ev.phases,
+            )
+        except WiringError as exc:
+            raise ValidationError(str(exc)) from None
+        p_max = wires.kw_per_a * min(ev.max_current_a, charger_a)
         feasible = 0.95 * p_max * eta * (d - a) * dt
         sessions.append(
             Session(
-                id=f"{prof.label[:3].upper()}-{i + 1:03d}",
+                id=sid,
                 charger_id=assignment[i],
                 arrival_step=a,
                 departure_step=d,
                 energy_kwh=float(round(min(float(energies[i]), feasible), 2)),
-                max_power_kw=ev.max_power_kw,
+                max_power_kw=ev.phases * NOMINAL_VOLTAGE_V * ev.max_current_a / 1000.0,
                 efficiency=eta,
-                min_power_kw=ev.min_power_kw,
+                phases=ev.phases,
+                max_current_a=ev.max_current_a,
             )
         )
 
-    limit = grid_limit_kw if grid_limit_kw is not None else prof.grid_kw_per_session * n_sessions
     base_peak = (
         base_load_peak_kw
         if base_load_peak_kw is not None
@@ -343,9 +450,9 @@ def generate(
     base = _base_load(horizon, base_peak, prof.base_profile, rng)
     pv = pv_profile(horizon, pv_kwp, rng)
     return Scenario(
-        name=kind,
+        name=kind if grid_type is None else f"{kind}-{grid_type.value}",
         horizon=horizon,
-        site=Site(grid_limit_kw=limit, chargers=chargers),
+        site=Site(grid_limit_kw=limit, chargers=chargers, supply=supply),
         tariff=tariff,
         sessions=tuple(sessions),
         base_load_kw=base,
@@ -363,6 +470,10 @@ class ScenarioOptions(TypedDict, total=False):
     pv_kwp: float
     base_load_peak_kw: float | None
     demand_charge_eur_per_kw: float
+    grid: GridType | str | None
+    line_limit_a: float | None
+    rotate_phases: bool
+    single_phase_share: float | None
 
 
 def workplace(**options: Unpack[ScenarioOptions]) -> Scenario:

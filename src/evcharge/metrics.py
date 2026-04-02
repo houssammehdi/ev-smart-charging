@@ -7,6 +7,7 @@ differences in what the site pays.
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass
 
 import numpy as np
@@ -55,6 +56,8 @@ class Metrics:
         load_factor_pct: Mean import divided by peak import.
         violations: Number of corrected commands.
         runtime_s: Wall-clock simulation time (policy computation included).
+        max_line_loading_pct: Highest modelled line current relative to its
+            limit over all lines and steps (phase-aware sites; NaN otherwise).
     """
 
     policy: str
@@ -73,6 +76,7 @@ class Metrics:
     load_factor_pct: float
     violations: int
     runtime_s: float
+    max_line_loading_pct: float = math.nan
 
     def as_dict(self) -> dict[str, float | int | str]:
         """Plain-dict view (JSON serialisable)."""
@@ -111,6 +115,11 @@ def compute_metrics(
     fractions = delivered / requested if requested.size else np.zeros(0)
     completed = float(np.mean(unmet <= COMPLETED_TOL_KWH) * 100.0) if requested.size else 100.0
     mean_import = float(imp.mean())
+    loading = math.nan
+    supply = sc.site.supply
+    if supply is not None and result.line_current_a is not None:
+        limits = np.array(supply.line_limit_a)
+        loading = float((result.line_current_a / limits[None, :]).max(initial=0.0) * 100.0)
 
     return Metrics(
         policy=result.policy_name,
@@ -129,4 +138,5 @@ def compute_metrics(
         load_factor_pct=100.0 * mean_import / peak if peak > 0 else 0.0,
         violations=len(result.violations),
         runtime_s=result.runtime_s,
+        max_line_loading_pct=loading,
     )

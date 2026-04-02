@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+from evcharge.policies.adapters import PhaseBlind
 from evcharge.policies.base import Observation, OnlinePolicy, Policy, SessionState, Setpoints
 from evcharge.policies.heuristics import (
     EarliestDeadlineFirst,
@@ -44,6 +45,7 @@ __all__ = [
     "Observation",
     "OnlinePolicy",
     "OptimalSchedule",
+    "PhaseBlind",
     "Policy",
     "PriceAware",
     "SessionState",

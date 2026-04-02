@@ -94,3 +94,46 @@ def test_parameters_and_errors() -> None:
         scenarios.generate("workplace", pv_kwp=-1.0)
     with pytest.raises(ValidationError, match="exceeds the grid limit"):
         scenarios.generate("workplace", n_sessions=10, grid_limit_kw=5.0, base_load_peak_kw=10.0)
+
+
+@pytest.mark.parametrize("grid", ["TN", "IT"])
+def test_phase_aware_generator(grid: str) -> None:
+    kw = scenarios.generate("residential", n_sessions=30, seed=5)
+    ph = scenarios.generate("residential", n_sessions=30, seed=5, grid=grid)
+    assert ph.name == f"residential-{grid}"
+    # phase options never change the random draws
+    assert [(s.arrival_step, s.departure_step) for s in ph.sessions] == [
+        (s.arrival_step, s.departure_step) for s in kw.sessions
+    ]
+    np.testing.assert_array_equal(ph.tariff.price_eur_per_kwh, kw.tariff.price_eur_per_kwh)
+    np.testing.assert_array_equal(ph.base_load, kw.base_load)
+    assert ph.site.supply is not None
+    assert ph.site.supply.fuse_equivalent_kw == pytest.approx(ph.site.grid_limit_kw)
+    assert [c.rotation for c in ph.site.chargers[:4]] == ["L1L2L3", "L2L3L1", "L3L1L2", "L1L2L3"]
+    for s_kw, s_ph in zip(kw.sessions, ph.sessions, strict=True):
+        ctl = ph.control(s_ph)
+        assert ctl.unit == "A"
+        assert ctl.charge_min == 6.0
+        assert s_ph.phases == (1 if s_kw.max_power_kw == 3.7 else 3)
+        # requests stay individually feasible with the real (grid-dependent) power
+        p_max = ctl.charge_max * ctl.kw_per_unit
+        assert s_ph.energy_kwh <= p_max * s_ph.efficiency * s_ph.dwell_steps * ph.horizon.dt_h
+    if grid == "TN":
+        assert [s.energy_kwh for s in ph.sessions] == [s.energy_kwh for s in kw.sessions]
+
+
+def test_single_phase_share_and_rotation_options() -> None:
+    sc = scenarios.generate(
+        "depot", n_sessions=40, seed=2, grid="TN", single_phase_share=1.0, rotate_phases=False
+    )
+    assert all(s.phases == 1 for s in sc.sessions)
+    assert all(c.rotation == "L1L2L3" for c in sc.site.chargers)
+    none = scenarios.generate("workplace", n_sessions=40, seed=2, grid="IT", single_phase_share=0)
+    assert all(s.phases == 3 for s in none.sessions)
+    fused = scenarios.generate("workplace", n_sessions=10, seed=2, grid="IT", line_limit_a=40.0)
+    assert fused.site.supply is not None
+    assert fused.site.supply.line_limit_a == (40.0, 40.0, 40.0)
+    with pytest.raises(ValidationError, match="phase-aware grid"):
+        scenarios.generate("workplace", line_limit_a=40.0)
+    with pytest.raises(ValidationError, match=r"\[0, 1\]"):
+        scenarios.generate("workplace", grid="TN", single_phase_share=1.5)

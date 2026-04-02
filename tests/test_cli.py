@@ -104,3 +104,37 @@ def test_errors_exit_with_status_2(tmp_path: Path, capsys: pytest.CaptureFixture
     assert main(["compare", "--sessions", "0"]) == 2
     with pytest.raises(SystemExit):
         main(["compare", "--policies", "magic"])
+
+
+def test_compare_phase_aware_site(capsys: pytest.CaptureFixture[str]) -> None:
+    code = main(
+        [
+            "compare",
+            "--scenario",
+            "residential",
+            "--sessions",
+            "6",
+            "--grid",
+            "IT",
+            "--line-limit",
+            "40",
+            "--no-rotation",
+            "--single-phase-share",
+            "0.5",
+            "--policies",
+            "llf",
+            "optimal",
+        ]
+    )
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "IT 40/40/40 A per line" in out
+    header = next(line for line in out.splitlines() if line.startswith("policy"))
+    assert "line %" in header
+
+
+def test_json_output_has_no_nan(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["compare", "--sessions", "3", "--policies", "edf", "--format", "json"]) == 0
+    text = capsys.readouterr().out
+    assert "NaN" not in text
+    assert json.loads(text)["results"][0]["max_line_loading_pct"] is None
