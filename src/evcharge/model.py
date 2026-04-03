@@ -23,7 +23,7 @@ Every dataclass validates itself on construction and raises
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from itertools import pairwise
 
@@ -214,8 +214,9 @@ def on_grid(value: float, step: float) -> bool:
 class Control:
     """How one session is commanded: setpoint unit, range and resolution.
 
-    A setpoint ``x`` is either 0 (paused) or charging in
-    ``[charge_min, charge_max]`` on a grid of ``step``.
+    A setpoint ``x`` is 0 (paused), charging in ``[charge_min, charge_max]`` or,
+    for bidirectional sessions, discharging with ``-x`` in
+    ``[discharge_min, discharge_max]``, always on a grid of ``step``.
 
     Attributes:
         unit: ``"kW"`` on aggregate sites, ``"A"`` (per phase) on phase-aware sites.
@@ -224,6 +225,8 @@ class Control:
         charge_min: Lowest non-zero setpoint (the IEC 61851 6 A minimum).
         charge_max: Highest setpoint (charger, cable and on-board-charger limits).
         step: Setpoint resolution; 0 means continuous.
+        discharge_min: Lowest non-zero discharge magnitude.
+        discharge_max: Highest discharge magnitude; 0 means the session cannot discharge.
     """
 
     unit: str
@@ -231,6 +234,17 @@ class Control:
     charge_min: float
     charge_max: float
     step: float = 0.0
+    discharge_min: float = 0.0
+    discharge_max: float = 0.0
+
+    @property
+    def can_discharge(self) -> bool:
+        """Whether negative (discharging) setpoints are allowed."""
+        return self.discharge_max > 0.0
+
+    def minimum(self, setpoint: float) -> float:
+        """Lowest non-zero magnitude in the direction of ``setpoint``."""
+        return self.discharge_min if setpoint < 0 else self.charge_min
 
     def snap_down(self, value: float) -> float:
         """Round a non-negative setpoint down to the resolution."""
@@ -267,6 +281,9 @@ class Charger:
             ``max_power_kw``).
         min_current_a: Lowest non-zero current (IEC 61851: 6 A).
         current_step_a: Setpoint resolution in amperes (0 = continuous).
+        bidirectional: Whether the charger can discharge an EV (V2G). A session
+            discharges only if its charger is bidirectional and it has a
+            :class:`V2G` spec.
     """
 
     id: str
@@ -277,6 +294,7 @@ class Charger:
     max_current_a: float | None = None
     min_current_a: float = IEC_61851_MIN_CURRENT_A
     current_step_a: float = DEFAULT_CURRENT_STEP_A
+    bidirectional: bool = False
 
     def __post_init__(self) -> None:
         if not self.id:
@@ -318,16 +336,24 @@ class Site:
         chargers: Charge points installed at the site.
         supply: Phase-aware connection (grid type and per-line current limits).
             ``None`` gives the aggregate kW model.
+        export_limit_kw: Maximum export at the connection point
+            (``None``: ``grid_limit_kw``). EV discharge may not push export above
+            it; PV alone never forces EVs to charge.
     """
 
     grid_limit_kw: float
     chargers: tuple[Charger, ...]
     supply: Supply | None = None
+    export_limit_kw: float | None = None
 
     def __post_init__(self) -> None:
         _require_finite("grid_limit_kw", self.grid_limit_kw)
         if self.grid_limit_kw <= 0:
             raise ValidationError(f"grid_limit_kw must be > 0, got {self.grid_limit_kw}")
+        if self.export_limit_kw is not None:
+            _require_finite("export_limit_kw", self.export_limit_kw)
+            if self.export_limit_kw < 0:
+                raise ValidationError(f"export_limit_kw must be >= 0, got {self.export_limit_kw}")
         if not self.chargers:
             raise ValidationError("a site needs at least one charger")
         ids = [c.id for c in self.chargers]
@@ -350,6 +376,16 @@ class Site:
         """Whether the site has per-line current limits (:attr:`supply` is set)."""
         return self.supply is not None
 
+    @property
+    def bidirectional(self) -> bool:
+        """Whether any charger can discharge (the site then has export rows)."""
+        return any(c.bidirectional for c in self.chargers)
+
+    @property
+    def export_limit(self) -> float:
+        """Export limit in kW (``export_limit_kw`` or ``grid_limit_kw``)."""
+        return self.grid_limit_kw if self.export_limit_kw is None else self.export_limit_kw
+
     def charger_lines(self, charger: Charger) -> tuple[int, ...]:
         """Site lines of the charger's conductors (phase-aware sites only)."""
         if self.supply is None:
@@ -358,6 +394,72 @@ class Site:
             return parse_rotation(charger.rotation, charger.phases, self.supply.grid)
         except WiringError as exc:
             raise ValidationError(f"charger {charger.id}: {exc}") from None
+
+
+@dataclass(frozen=True)
+class V2G:
+    """Battery and bidirectional capability of one session.
+
+    With a V2G spec the session is modelled by its battery energy: it arrives
+    with ``initial_kwh``, must leave with at least ``initial_kwh + energy_kwh``
+    (the session's request), and in between its energy stays within
+    ``[min_kwh, max_kwh]``, which the EV's battery management enforces. It
+    discharges only on a bidirectional charger.
+
+    Attributes:
+        capacity_kwh: Usable battery capacity.
+        initial_kwh: Battery energy at arrival.
+        min_kwh: Lowest energy the aggregator may discharge to (the driver's reserve).
+        max_kwh: Highest energy while plugged in (``None``: the capacity); charging stops here.
+        max_discharge_kw: Discharge power limit in kW (``None``: the charge limit).
+        max_discharge_current_a: Discharge current limit per phase on
+            phase-aware sites (``None``: the charge limit).
+        discharge_efficiency: Battery-to-grid efficiency in ``(0, 1]``; a
+            discharge of ``p`` kW for ``dt`` hours takes ``p * dt / efficiency``
+            kWh out of the battery.
+        degradation_eur_per_kwh: Cost per kWh of battery throughput, counted on
+            both energy charged into and discharged from the battery.
+    """
+
+    capacity_kwh: float
+    initial_kwh: float
+    min_kwh: float = 0.0
+    max_kwh: float | None = None
+    max_discharge_kw: float | None = None
+    max_discharge_current_a: float | None = None
+    discharge_efficiency: float = 0.9
+    degradation_eur_per_kwh: float = 0.0
+
+    def __post_init__(self) -> None:
+        for name in ("capacity_kwh", "initial_kwh", "min_kwh", "discharge_efficiency"):
+            _require_finite(f"v2g {name}", float(getattr(self, name)))
+        _require_finite("v2g degradation_eur_per_kwh", self.degradation_eur_per_kwh)
+        if self.capacity_kwh <= 0:
+            raise ValidationError("v2g capacity_kwh must be > 0")
+        ceiling = self.capacity_kwh if self.max_kwh is None else self.max_kwh
+        _require_finite("v2g max_kwh", ceiling)
+        if not 0 <= self.min_kwh <= self.initial_kwh <= ceiling <= self.capacity_kwh:
+            raise ValidationError(
+                "v2g needs 0 <= min_kwh <= initial_kwh <= max_kwh <= capacity_kwh, got "
+                f"{self.min_kwh} <= {self.initial_kwh} <= {ceiling} <= {self.capacity_kwh}"
+            )
+        if not 0 < self.discharge_efficiency <= 1:
+            raise ValidationError("v2g discharge_efficiency must be in (0, 1]")
+        if self.degradation_eur_per_kwh < 0:
+            raise ValidationError("v2g degradation_eur_per_kwh must be >= 0")
+        for name in ("max_discharge_kw", "max_discharge_current_a"):
+            value = getattr(self, name)
+            if value is not None:
+                _require_finite(f"v2g {name}", value)
+                if value <= 0:
+                    raise ValidationError(f"v2g {name} must be > 0")
+        object.__setattr__(self, "max_kwh", ceiling)
+
+    @property
+    def ceiling_kwh(self) -> float:
+        """``max_kwh`` resolved (never ``None`` after validation)."""
+        assert self.max_kwh is not None
+        return self.max_kwh
 
 
 @dataclass(frozen=True)
@@ -380,6 +482,9 @@ class Session:
         phases: Phases the on-board charger uses (1, 2 or 3; phase-aware sites).
         max_current_a: Per-phase current limit of the on-board charger
             (``None``: derived from ``max_power_kw``; phase-aware sites).
+        v2g: Battery state and bidirectional capability (``None``: charge-only,
+            and the EV stops when ``energy_kwh`` is delivered). With a spec the
+            request may be 0 (leave with the arrival energy).
     """
 
     id: str
@@ -392,6 +497,7 @@ class Session:
     min_power_kw: float | None = None
     phases: int = 3
     max_current_a: float | None = None
+    v2g: V2G | None = None
 
     def __post_init__(self) -> None:
         if not self.id:
@@ -406,8 +512,17 @@ class Session:
             )
         for name in ("energy_kwh", "max_power_kw", "efficiency"):
             _require_finite(f"{where}: {name}", float(getattr(self, name)))
-        if self.energy_kwh <= 0:
+        if self.v2g is None and self.energy_kwh <= 0:
             raise ValidationError(f"{where}: energy_kwh must be > 0")
+        if self.v2g is not None:
+            if self.energy_kwh < 0:
+                raise ValidationError(f"{where}: energy_kwh must be >= 0")
+            target = self.v2g.initial_kwh + self.energy_kwh
+            if target > self.v2g.ceiling_kwh + ENERGY_TOL_KWH:
+                raise ValidationError(
+                    f"{where}: the departure target {target:.2f} kWh (arrival energy plus "
+                    f"request) exceeds max_kwh {self.v2g.ceiling_kwh:.2f} kWh"
+                )
         if self.max_power_kw <= 0:
             raise ValidationError(f"{where}: max_power_kw must be > 0")
         if not 0 < self.efficiency <= 1:
@@ -427,6 +542,13 @@ class Session:
     def dwell_steps(self) -> int:
         """Number of steps the EV is connected."""
         return self.departure_step - self.arrival_step
+
+    @property
+    def target_kwh(self) -> float | None:
+        """Battery energy required at departure for V2G sessions (``None`` otherwise)."""
+        if self.v2g is None:
+            return None
+        return self.v2g.initial_kwh + self.energy_kwh
 
     def is_connected(self, step: int) -> bool:
         """Whether the EV is plugged in during ``step``."""
@@ -640,10 +762,16 @@ class Scenario:
     def _describe(self, s: Session) -> tuple[Control, Wiring | None]:
         charger = self.site.charger(s.charger_id)
         supply = self.site.supply
+        v2g = s.v2g if charger.bidirectional else None
         if supply is None:
             p_max = min(charger.max_power_kw, s.max_power_kw)
-            p_min = charger.min_power_kw if s.min_power_kw is None else s.min_power_kw
-            return Control("kW", 1.0, min(p_min, p_max), p_max), None
+            p_min = min(charger.min_power_kw if s.min_power_kw is None else s.min_power_kw, p_max)
+            d_min = d_max = 0.0
+            if v2g is not None:
+                cap = v2g.max_discharge_kw
+                d_max = p_max if cap is None else min(p_max, cap)
+                d_min = min(p_min, d_max)
+            return Control("kW", 1.0, p_min, p_max, 0.0, d_min, d_max), None
         lines = self.site.charger_lines(charger)
         try:
             wires = wiring(supply.grid, supply.voltage_v, charger.phases, lines, s.phases)
@@ -663,23 +791,47 @@ class Scenario:
                 f"session {s.id}: the EV cannot charge at the {i_min:g} A minimum "
                 f"(at most {i_max:g} A on {wires.phases} phase(s))"
             )
-        return Control("A", k, i_min, i_max, step), wires
+        d_min = d_max = 0.0
+        if v2g is not None:
+            d_caps = [charger.max_power_kw / k]
+            d_caps += [c for c in (charger.max_current_a, v2g.max_discharge_current_a) if c]
+            d_caps += [] if v2g.max_discharge_kw is None else [v2g.max_discharge_kw / k]
+            d_max = snap_down(min(d_caps), step)
+            d_min = i_min
+            if d_max + CURRENT_TOL_A < d_min:
+                raise ValidationError(
+                    f"session {s.id}: the EV cannot discharge at the {d_min:g} A minimum "
+                    f"(at most {d_max:g} A)"
+                )
+        return Control("A", k, i_min, i_max, step, d_min, d_max), wires
 
     def _build_rows(self) -> RowModel:
-        site_import = np.maximum(0.0, self.site.grid_limit_kw - self.net_base_kw)
+        net = self.net_base_kw
+        site_import = np.maximum(0.0, self.site.grid_limit_kw - net)
+        site_export = np.maximum(0.0, self.site.export_limit + net)
         supply = self.site.supply
+        two_way = self.site.bidirectional
         if supply is None:
-            return RowModel(("site import",), ("site",), _frozen(site_import[:, None]))
+            if not two_way:
+                return RowModel(("site import",), ("site",), _frozen(site_import[:, None]))
+            return RowModel(
+                ("site import", "site export"),
+                ("site", "site"),
+                _frozen(np.column_stack([site_import, site_export])),
+            )
         kappa = 1.0 if supply.grid is GridType.TN else 0.0
-        limits = np.array(supply.line_limit_a)
-        line_import = np.maximum(
-            0.0, limits[None, :] - self.base_line_current_a + kappa * self.pv_line_current_a
-        )
-        return RowModel(
-            (*(f"{line} import" for line in LINES), "site import"),
-            ("line", "line", "line", "site"),
-            _frozen(np.column_stack([line_import, site_import])),
-        )
+        limits = np.array(supply.line_limit_a)[None, :]
+        base, pv = self.base_line_current_a, self.pv_line_current_a
+        line_import = np.maximum(0.0, limits - base + kappa * pv)
+        names: tuple[str, ...] = (*(f"{line} import" for line in LINES), "site import")
+        kinds: tuple[str, ...] = ("line", "line", "line", "site")
+        columns = [line_import, site_import[:, None]]
+        if two_way:
+            line_export = np.maximum(0.0, limits - pv + kappa * base)
+            names = (*names, *(f"{line} export" for line in LINES), "site export")
+            kinds = (*kinds, "line", "line", "line", "site")
+            columns += [line_export, site_export[:, None]]
+        return RowModel(names, kinds, _frozen(np.column_stack(columns)))
 
     @property
     def base_load(self) -> FloatArray:
@@ -742,11 +894,35 @@ class Scenario:
         return self._describe(session)[1]
 
     def row_coefficients(self, session: Session) -> FloatArray:
-        """Coefficient of the session's setpoint in every row of :attr:`rows`."""
+        """Coefficient of a charging setpoint in every row of :attr:`rows`.
+
+        Charging never counts in export rows, so an EV that stops early can
+        only lower export (see ``docs/theory.md``).
+        """
+        wires = self.wiring(session)
+        two_way = self.site.bidirectional
+        if wires is None:
+            return np.array([1.0, 0.0]) if two_way else np.ones(1)
+        coef = [*wires.incidence(), wires.kw_per_a]
+        return np.array(coef + [0.0] * 4 if two_way else coef)
+
+    def row_discharge_coefficients(self, session: Session) -> FloatArray:
+        """Coefficient of a discharge magnitude in every row of :attr:`rows`.
+
+        Discharge is credited against import in kW and, on TN grids, per line
+        (collinear currents); on IT grids line imports get no credit.
+        """
+        n = self.rows.n_rows
+        if not self.control(session).can_discharge:
+            return np.zeros(n)
         wires = self.wiring(session)
         if wires is None:
-            return np.ones(1)
-        return np.array([*wires.incidence(), wires.kw_per_a])
+            return np.array([-1.0, 1.0])
+        assert self.site.supply is not None
+        kappa = 1.0 if self.site.supply.grid is GridType.TN else 0.0
+        a = list(wires.incidence())
+        k = wires.kw_per_a
+        return np.array([-kappa * v for v in a] + [-k] + a + [k])
 
     def power_bounds(self, session: Session) -> tuple[float, float]:
         """Return ``(p_min, p_max)`` in kW for a session of this scenario.
@@ -771,7 +947,9 @@ class Scenario:
         Returns:
             Shape ``(n_steps, 3)``: on TN grids the magnitude of the signed sum of
             base load, PV and EV currents (exact for in-phase currents); on IT
-            grids the load current (PV gets no credit, see ``docs/theory.md``).
+            grids the larger of the load current and the injected current (PV and
+            discharge), which bounds the true current for unity-power-factor
+            devices (see ``docs/theory.md``).
         """
         supply = self.site.supply
         if supply is None:
@@ -784,11 +962,12 @@ class Scenario:
         incidence = np.array([self._wirings[s.id].incidence() for s in self.sessions]).reshape(
             len(self.sessions), 3
         )
-        ev = x.T @ incidence
+        charge = np.maximum(x, 0.0).T @ incidence
+        discharge = np.maximum(-x, 0.0).T @ incidence
         base, pv = self.base_line_current_a, self.pv_line_current_a
         if supply.grid is GridType.TN:
-            return np.asarray(np.abs(base - pv + ev), dtype=np.float64)
-        return np.asarray(base + ev, dtype=np.float64)
+            return np.asarray(np.abs(base - pv + charge - discharge), dtype=np.float64)
+        return np.asarray(np.maximum(base + charge, pv + discharge), dtype=np.float64)
 
     @property
     def energy_requested_kwh(self) -> float:
@@ -810,11 +989,20 @@ class Scenario:
         if self.site.supply is None:
             return self
         chargers = tuple(
-            Charger(c.id, c.max_power_kw, 0.0, current_step_a=0.0) for c in self.site.chargers
+            Charger(c.id, c.max_power_kw, 0.0, current_step_a=0.0, bidirectional=c.bidirectional)
+            for c in self.site.chargers
         )
         sessions = []
         for s in self.sessions:
             p_min, p_max = self.power_bounds(s)
+            ctl = self.control(s)
+            v2g = s.v2g
+            if v2g is not None and ctl.can_discharge:
+                v2g = replace(
+                    v2g,
+                    max_discharge_kw=ctl.discharge_max * ctl.kw_per_unit,
+                    max_discharge_current_a=None,
+                )
             sessions.append(
                 Session(
                     id=s.id,
@@ -825,16 +1013,40 @@ class Scenario:
                     max_power_kw=p_max,
                     efficiency=s.efficiency,
                     min_power_kw=p_min,
+                    v2g=v2g,
                 )
             )
         return Scenario(
             name=self.name,
             horizon=self.horizon,
-            site=Site(self.site.grid_limit_kw, chargers),
+            site=Site(self.site.grid_limit_kw, chargers, None, self.site.export_limit_kw),
             tariff=self.tariff,
             sessions=tuple(sessions),
             base_load_kw=self.base_load,
             pv_kw=self.pv,
+        )
+
+    def unidirectional(self) -> Scenario:
+        """Copy in which no charger can discharge (unidirectional smart charging).
+
+        V2G sessions keep their battery model (arrival energy, departure target
+        and ceiling), so this is the like-for-like baseline for V2G.
+        """
+        chargers = tuple(replace(c, bidirectional=False) for c in self.site.chargers)
+        return self.with_site(replace(self.site, chargers=chargers))
+
+    def with_site(self, site: Site) -> Scenario:
+        """Copy of the scenario on a different site (same sessions and series)."""
+        return Scenario(
+            name=self.name,
+            horizon=self.horizon,
+            site=site,
+            tariff=self.tariff,
+            sessions=self.sessions,
+            base_load_kw=self.base_load,
+            pv_kw=self.pv,
+            base_current_a=self.base_current_a if site.phase_aware else None,
+            pv_current_a=self.pv_current_a if site.phase_aware else None,
         )
 
     def with_sessions(self, sessions: tuple[Session, ...]) -> Scenario:

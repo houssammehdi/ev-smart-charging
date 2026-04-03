@@ -46,6 +46,10 @@ class SessionState:
         dt_h: Step length in hours.
         control_spec: How the session is commanded; ``None`` means kW setpoints
             in ``[p_min_kw, p_max_kw]`` (the aggregate model).
+        battery_kwh: Battery energy now, for sessions with a
+            :class:`~evcharge.model.V2G` spec (``None`` otherwise). For them
+            ``delivered_kwh`` is the net energy added since arrival and can be
+            negative after discharging.
     """
 
     session: Session
@@ -55,6 +59,7 @@ class SessionState:
     steps_left: int
     dt_h: float
     control_spec: Control | None = None
+    battery_kwh: float | None = None
 
     @cached_property
     def control(self) -> Control:
@@ -97,7 +102,24 @@ class SessionState:
     @property
     def delivered_fraction(self) -> float:
         """Share of the request delivered so far, in ``[0, 1]``."""
-        return min(1.0, self.delivered_kwh / self.session.energy_kwh)
+        if self.session.energy_kwh <= 0.0:
+            return 1.0
+        return min(1.0, max(0.0, self.delivered_kwh) / self.session.energy_kwh)
+
+    @property
+    def discharge_limit(self) -> float:
+        """Largest discharge magnitude (setpoint unit) the battery sustains for a whole step.
+
+        0 for sessions that cannot discharge; otherwise the control's maximum,
+        capped so the battery does not go below its ``min_kwh`` floor.
+        """
+        ctl = self.control
+        v2g = self.session.v2g
+        if not ctl.can_discharge or v2g is None or self.battery_kwh is None:
+            return 0.0
+        room = max(0.0, self.battery_kwh - v2g.min_kwh)
+        sustainable = room * v2g.discharge_efficiency / (ctl.kw_per_unit * self.dt_h)
+        return min(ctl.discharge_max, sustainable)
 
 
 @dataclass(frozen=True)
@@ -302,7 +324,9 @@ def finalize(
     """Turn continuous setpoints (e.g. from an LP) into feasible charger commands.
 
     Setpoints are clipped to their range and first rounded down to the
-    resolution, pausing any that fall below the minimum; then the most
+    resolution (discharge setpoints toward zero, and never beyond what the
+    battery sustains for the step), pausing any that fall below the minimum;
+    then the most
     flexible ones (most spare setpoint later, then largest margin above the
     minimum) are trimmed until every row of the step holds, which also absorbs
     solver tolerances (see :func:`~evcharge.capacity.trim_to_rows`). Finally
@@ -329,9 +353,15 @@ def finalize(
     ups: list[tuple[float, str, float]] = []
     for sid, value in desired.items():
         st = states.get(sid)
-        if st is None or value <= POWER_TOL_KW:
+        if st is None or abs(value) <= POWER_TOL_KW:
             continue
         ctl = st.control
+        if value < 0.0:
+            # discharge: never more than the battery sustains, rounded toward zero
+            magnitude = ctl.snap_down(min(-float(value), st.discharge_limit))
+            if magnitude + POWER_TOL_KW >= ctl.discharge_min and magnitude > POWER_TOL_KW:
+                floors[sid] = -max(magnitude, ctl.discharge_min)
+            continue
         v = min(float(value), ctl.charge_max)
         if v + POWER_TOL_KW < ctl.charge_min:
             continue
@@ -355,12 +385,14 @@ def finalize(
 
     def room_left(sid: str, x: float) -> float:
         # spare setpoint later minus what this step already leaves to make up
+        if sid not in target:
+            return 0.0
         return later.get(sid, math.inf) - (target[sid] - x)
 
     fitted = trim_to_rows(floors, obs.rows, controls, rank=room_left)
     alloc = obs.allocation()
     for sid, v in fitted.items():
-        alloc.take(sid, v)
+        alloc.book(sid, v)
     urgent = {sid for pri, sid, _ in ups if pri >= 3.0}
     for pri, sid, up in sorted(ups, key=lambda u: (-u[0], u[1])):
         base = fitted.get(sid, 0.0)
@@ -389,7 +421,7 @@ def _make_room(
     Only sessions that could still make up one more step later qualify.
     """
     candidates = sorted(
-        (c for c in fitted if c != sid and c not in urgent),
+        (c for c in fitted if c != sid and c not in urgent and fitted[c] > 0.0),
         key=lambda c: (-room_left(c, fitted[c]), c),
     )
     for c in candidates:

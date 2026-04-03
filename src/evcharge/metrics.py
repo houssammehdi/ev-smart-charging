@@ -40,17 +40,20 @@ class Metrics:
     Attributes:
         policy: Policy name.
         energy_requested_kwh: Sum of energy requests.
-        energy_delivered_kwh: Sum of energy delivered into batteries.
+        energy_delivered_kwh: Requested energy that was delivered (requested minus
+            unmet; for V2G sessions energy above the target does not count).
         delivered_pct: Delivered / requested, in percent.
         unmet_kwh: Requested but not delivered energy.
         sessions_completed_pct: Share of sessions missing at most 0.01 kWh.
         energy_cost_eur: Import cost minus export revenue (site level).
         peak_import_kw: Highest average import over one step (>= 0).
         demand_charge_eur: ``demand_charge * peak_import_kw``.
-        total_cost_eur: Energy cost plus demand charge.
+        total_cost_eur: Energy cost plus demand charge plus battery degradation.
         penalised_cost_eur: Total cost plus ``unmet_penalty * unmet_kwh``; the
             objective the optimisation policies minimise.
-        jain_fairness: Jain's index of per-session delivered fractions.
+        jain_fairness: Jain's index of per-session delivered fractions (a
+            session that requests nothing counts as fully served unless it
+            leaves with less than it arrived with).
         capacity_utilisation_pct: EV energy drawn divided by the EV headroom
             energy available in steps with at least one EV connected.
         load_factor_pct: Mean import divided by peak import.
@@ -58,6 +61,10 @@ class Metrics:
         runtime_s: Wall-clock simulation time (policy computation included).
         max_line_loading_pct: Highest modelled line current relative to its
             limit over all lines and steps (phase-aware sites; NaN otherwise).
+        discharged_kwh: Grid-side energy discharged by EVs (V2G).
+        degradation_cost_eur: Battery degradation of V2G sessions: their
+            ``degradation_eur_per_kwh`` times the energy charged into and
+            discharged from the battery (both directions count).
     """
 
     policy: str
@@ -77,6 +84,8 @@ class Metrics:
     violations: int
     runtime_s: float
     max_line_loading_pct: float = math.nan
+    discharged_kwh: float = 0.0
+    degradation_cost_eur: float = 0.0
 
     def as_dict(self) -> dict[str, float | int | str]:
         """Plain-dict view (JSON serialisable)."""
@@ -93,10 +102,9 @@ def compute_metrics(
     dt = sc.horizon.dt_h
     tariff = sc.tariff
     requested = np.array([s.energy_kwh for s in sc.sessions], dtype=np.float64)
-    delivered = result.delivered_kwh
-    req_total = float(requested.sum())
-    del_total = float(delivered.sum())
     unmet = result.unmet_kwh
+    req_total = float(requested.sum())
+    del_total = float((requested - unmet).sum())
 
     imp = result.import_kw
     exp = result.export_kw
@@ -105,15 +113,24 @@ def compute_metrics(
     )
     peak = float(max(0.0, imp.max(initial=0.0)))
     demand = tariff.demand_charge_eur_per_kw * peak
-    total = energy_cost + demand
+    charged = np.maximum(result.power_kw, 0.0).sum(axis=1) * dt
+    discharged = np.maximum(-result.power_kw, 0.0).sum(axis=1) * dt
+    degradation = 0.0
+    for i, s in enumerate(sc.sessions):
+        if s.v2g is not None and s.v2g.degradation_eur_per_kwh > 0.0:
+            throughput = s.efficiency * charged[i] + discharged[i] / s.v2g.discharge_efficiency
+            degradation += s.v2g.degradation_eur_per_kwh * float(throughput)
+    total = energy_cost + demand + degradation
 
     connected = np.zeros(sc.horizon.n_steps, dtype=bool)
     for s in sc.sessions:
         connected[s.arrival_step : s.departure_step] = True
     available = float(np.sum(sc.ev_headroom_kw[connected]) * dt)
-    ev_energy = float(result.power_kw.sum() * dt)
-    fractions = delivered / requested if requested.size else np.zeros(0)
-    completed = float(np.mean(unmet <= COMPLETED_TOL_KWH) * 100.0) if requested.size else 100.0
+    ev_energy = float(charged.sum())
+    met = unmet <= COMPLETED_TOL_KWH
+    safe = np.where(requested > 0.0, requested, 1.0)
+    fractions = np.where(requested > 0.0, 1.0 - unmet / safe, np.where(met, 1.0, 0.0))
+    completed = float(np.mean(met) * 100.0) if requested.size else 100.0
     mean_import = float(imp.mean())
     loading = math.nan
     supply = sc.site.supply
@@ -139,4 +156,6 @@ def compute_metrics(
         violations=len(result.violations),
         runtime_s=result.runtime_s,
         max_line_loading_pct=loading,
+        discharged_kwh=float(discharged.sum()),
+        degradation_cost_eur=degradation,
     )

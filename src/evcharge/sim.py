@@ -6,9 +6,12 @@ At every step the simulator
 2. asks the policy for setpoints (kW, or A per phase on phase-aware sites),
 3. enforces physics and site rules on the commands, recording every correction
    as a :class:`Violation` (well-behaved policies produce none),
-4. lets each EV draw ``min(command, power that finishes its request)``, and
-5. records per-session power, the resulting site import and, on phase-aware
-   sites, the current on every line.
+4. lets each EV draw ``min(command, power that finishes its request)``; an EV
+   with a :class:`~evcharge.model.V2G` spec instead charges until its battery
+   ceiling and discharges when commanded (negative setpoints), never below
+   its floor, and
+5. records per-session power, the resulting site import, battery energies and,
+   on phase-aware sites, the current on every line.
 """
 
 from __future__ import annotations
@@ -29,7 +32,7 @@ class ViolationKind(StrEnum):
     """Categories of commands the simulator had to correct."""
 
     INVALID = "invalid"
-    """Negative, NaN or infinite setpoint (applied as 0)."""
+    """NaN or infinite setpoint, or a negative one for a session that cannot discharge."""
     NOT_CONNECTED = "not-connected"
     """Setpoint for an unknown or unplugged session (ignored)."""
     ABOVE_MAX = "above-max"
@@ -38,6 +41,8 @@ class ViolationKind(StrEnum):
     """Setpoint not a multiple of the charger's resolution (rounded down)."""
     BELOW_MIN = "below-min"
     """Non-zero setpoint below the minimum current (charger pauses: 0)."""
+    SOC_LIMIT = "soc-limit"
+    """Discharge beyond what the battery holds above its floor for the step (clipped)."""
     SITE_LIMIT = "site-limit"
     """Setpoints above the site's kW headroom (scaled down proportionally)."""
     LINE_LIMIT = "line-limit"
@@ -92,6 +97,9 @@ class SimulationResult:
         setpoint: Commands after enforcement in each session's control unit.
         line_current_a: Modelled current per line, shape ``(n_steps, 3)``, from
             the commands of sessions that drew power (``None`` on aggregate sites).
+        battery_kwh: Battery energy at the end of each step for sessions with a
+            V2G spec, shape ``(n_sessions, n_steps)``; NaN for other sessions
+            and outside the plug-in window.
     """
 
     scenario: Scenario
@@ -104,6 +112,7 @@ class SimulationResult:
     runtime_s: float
     setpoint: FloatArray | None = None
     line_current_a: FloatArray | None = None
+    battery_kwh: FloatArray | None = None
 
     @property
     def import_kw(self) -> FloatArray:
@@ -117,7 +126,7 @@ class SimulationResult:
 
     @property
     def ev_power_kw(self) -> FloatArray:
-        """Total EV charging power per step."""
+        """Total EV power per step (discharge counts negative)."""
         return np.asarray(self.power_kw.sum(axis=0), dtype=np.float64)
 
     @property
@@ -125,6 +134,33 @@ class SimulationResult:
         """Undelivered energy per session."""
         requested = np.array([s.energy_kwh for s in self.scenario.sessions], dtype=np.float64)
         return np.maximum(requested - self.delivered_kwh, 0.0)
+
+
+def _enforce_discharge(
+    step: int, sid: str, magnitude: float, st: SessionState, violations: list[Violation]
+) -> float:
+    """Checked discharge magnitude of one command (0 if it has to pause)."""
+    ctl = st.control
+    unit = ctl.unit
+    m = magnitude
+    if m > ctl.discharge_max + POWER_TOL_KW:
+        top = ctl.discharge_max
+        violations.append(Violation(step, ViolationKind.ABOVE_MAX, sid, -m, -top, unit))
+        m = top
+    if not on_grid(m, ctl.step):
+        rounded = ctl.snap_down(m)
+        violations.append(Violation(step, ViolationKind.RESOLUTION, sid, -m, -rounded, unit))
+        m = rounded
+    limit = st.discharge_limit
+    if m > limit + POWER_TOL_KW:
+        allowed = ctl.snap_down(limit)
+        violations.append(Violation(step, ViolationKind.SOC_LIMIT, sid, -m, -allowed, unit))
+        m = allowed
+    if m < ctl.discharge_min - POWER_TOL_KW:
+        if m > POWER_TOL_KW:
+            violations.append(Violation(step, ViolationKind.BELOW_MIN, sid, -m, 0.0, unit))
+        return 0.0
+    return min(max(m, ctl.discharge_min), ctl.discharge_max)
 
 
 def _enforce(
@@ -145,8 +181,13 @@ def _enforce(
             continue
         ctl = st.control
         unit = ctl.unit
-        if not math.isfinite(v) or v < -POWER_TOL_KW:
+        if not math.isfinite(v) or (v < -POWER_TOL_KW and not ctl.can_discharge):
             violations.append(Violation(step, ViolationKind.INVALID, sid, v, 0.0, unit))
+            continue
+        if v < -POWER_TOL_KW:
+            discharge = _enforce_discharge(step, sid, -v, st, violations)
+            if discharge > 0.0:
+                cmd[sid] = -discharge
             continue
         if v <= POWER_TOL_KW:
             continue
@@ -189,6 +230,11 @@ def simulate(scenario: Scenario, policy: Policy) -> SimulationResult:
     bounds = [scenario.power_bounds(s) for s in sessions]
     controls = [scenario.control(s) for s in sessions]
     coefficients = {s.id: scenario.row_coefficients(s) for s in sessions}
+    discharge_coef = {
+        s.id: scenario.row_discharge_coefficients(s)
+        for s, ctl in zip(sessions, controls, strict=True)
+        if ctl.can_discharge
+    }
     rows = scenario.rows
     headroom = scenario.ev_headroom_kw
     net_base = scenario.net_base_kw
@@ -197,6 +243,8 @@ def simulate(scenario: Scenario, policy: Policy) -> SimulationResult:
     setpoint_kw = np.zeros((n_s, n_t))
     power = np.zeros((n_s, n_t))
     delivered = np.zeros(n_s)
+    battery = np.array([np.nan if s.v2g is None else s.v2g.initial_kwh for s in sessions])
+    battery_log = np.full((n_s, n_t), np.nan)
     net_import = np.zeros(n_t)
     violations: list[Violation] = []
     peak = 0.0
@@ -213,9 +261,14 @@ def simulate(scenario: Scenario, policy: Policy) -> SimulationResult:
                     steps_left=s.departure_step - t,
                     dt_h=dt,
                     control_spec=controls[i],
+                    battery_kwh=None if s.v2g is None else float(battery[i]),
                 )
         step_rows = StepConstraints(
-            rows.names, rows.kinds, rows.rhs[t], {sid: coefficients[sid] for sid in states}
+            rows.names,
+            rows.kinds,
+            rows.rhs[t],
+            {sid: coefficients[sid] for sid in states},
+            {sid: discharge_coef[sid] for sid in states if sid in discharge_coef},
         )
         obs = Observation(
             step=t,
@@ -229,19 +282,35 @@ def simulate(scenario: Scenario, policy: Policy) -> SimulationResult:
         for sid, c in cmd.items():
             i = index[sid]
             st = states[sid]
+            s = sessions[i]
             c_kw = c * controls[i].kw_per_unit
-            drawn = min(c_kw, st.finish_kw)
             setpoint[i, t] = c
             setpoint_kw[i, t] = c_kw
+            if s.v2g is None:
+                drawn = min(c_kw, st.finish_kw)
+                delivered[i] = min(s.energy_kwh, delivered[i] + s.efficiency * drawn * dt)
+            elif c_kw >= 0.0:
+                # the battery management stops charging at the ceiling
+                room = max(0.0, s.v2g.ceiling_kwh - battery[i])
+                drawn = min(c_kw, room / (s.efficiency * dt))
+                battery[i] = min(s.v2g.ceiling_kwh, battery[i] + s.efficiency * drawn * dt)
+            else:
+                drawn = c_kw
+                taken = -drawn * dt / s.v2g.discharge_efficiency
+                battery[i] = max(s.v2g.min_kwh, battery[i] - taken)
+            if s.v2g is not None:
+                delivered[i] = battery[i] - s.v2g.initial_kwh
             power[i, t] = drawn
-            eta = sessions[i].efficiency
-            delivered[i] = min(sessions[i].energy_kwh, delivered[i] + eta * drawn * dt)
+        for sid in states:
+            i = index[sid]
+            if sessions[i].v2g is not None:
+                battery_log[i, t] = battery[i]
         net_import[t] = net_base[t] + power[:, t].sum()
         peak = max(peak, float(net_import[t]))
 
     line_current = None
     if scenario.site.phase_aware:
-        line_current = scenario.line_currents_a(np.where(power > 0.0, setpoint, 0.0))
+        line_current = scenario.line_currents_a(np.where(power != 0.0, setpoint, 0.0))
     return SimulationResult(
         scenario=scenario,
         policy_name=policy.name,
@@ -253,4 +322,5 @@ def simulate(scenario: Scenario, policy: Policy) -> SimulationResult:
         runtime_s=time.perf_counter() - started,
         setpoint=setpoint,
         line_current_a=line_current,
+        battery_kwh=battery_log if any(s.v2g is not None for s in sessions) else None,
     )

@@ -34,15 +34,18 @@ class StepConstraints:
         names: Row names, e.g. ``"L1 import"`` or ``"site import"``.
         kinds: ``"line"`` (amperes) or ``"site"`` (kW) per row.
         rhs: Right-hand side per row (never negative).
-        coefficients: Session id to the coefficient of its setpoint in every row.
-            Sessions not listed have coefficient 1 on every row, which is the
-            aggregate model's single kW row.
+        coefficients: Session id to the coefficient of its charging setpoint in
+            every row. Sessions not listed have coefficient 1 on every row, which
+            is the aggregate model's single kW row.
+        discharge: Session id to the coefficient of its discharge magnitude in
+            every row (bidirectional sessions only).
     """
 
     names: tuple[str, ...]
     kinds: tuple[str, ...]
     rhs: FloatArray
     coefficients: Mapping[str, FloatArray] = field(default_factory=dict)
+    discharge: Mapping[str, FloatArray] = field(default_factory=dict)
 
     @classmethod
     def single(cls, headroom_kw: float) -> StepConstraints:
@@ -70,12 +73,25 @@ class StepConstraints:
             return _UNIT_ROW
         return a
 
+    def discharge_coefficient(self, session_id: str) -> FloatArray:
+        """Coefficient vector of a session's discharge magnitude."""
+        a = self.discharge.get(session_id)
+        if a is None:
+            raise KeyError(f"session {session_id!r} cannot discharge at this step")
+        return a
+
+    def contribution(self, session_id: str, setpoint: float) -> FloatArray:
+        """What a signed setpoint adds to every row (negative setpoints discharge)."""
+        if setpoint >= 0:
+            return self.coefficient(session_id) * setpoint
+        return self.discharge_coefficient(session_id) * -setpoint
+
     def usage(self, setpoints: Mapping[str, float]) -> FloatArray:
-        """Left-hand side of every row for the given setpoints."""
+        """Left-hand side of every row for the given (signed) setpoints."""
         out = np.zeros(self.n_rows)
         for sid, x in setpoints.items():
             if x:
-                out += self.coefficient(sid) * x
+                out += self.contribution(sid, x)
         return out
 
 
@@ -105,8 +121,12 @@ class Allocation:
         return max(0.0, float(np.min(self.slack[pos] / a[pos])))
 
     def take(self, session_id: str, amount: float) -> None:
-        """Book ``amount`` of setpoint for ``session_id``."""
+        """Book ``amount`` more (or, if negative, less) charging setpoint for ``session_id``."""
         self.slack -= self.constraints.coefficient(session_id) * amount
+
+    def book(self, session_id: str, setpoint: float) -> None:
+        """Book a whole signed setpoint (negative: discharging) for ``session_id``."""
+        self.slack -= self.constraints.contribution(session_id, setpoint)
 
 
 def fit_to_rows(
@@ -139,9 +159,9 @@ def fit_to_rows(
             return x, fixes
         fixes.append((r, float(usage[r]), float(constraints.rhs[r])))
         contrib = {
-            sid: float(constraints.coefficient(sid)[r] * v)
+            sid: float(constraints.contribution(sid, v)[r])
             for sid, v in x.items()
-            if constraints.coefficient(sid)[r] * v > 0
+            if constraints.contribution(sid, v)[r] > 0
         }
         rounds += 1
         if rounds > 4 * constraints.n_rows + 4:
@@ -153,11 +173,12 @@ def fit_to_rows(
         scale = allowed / total
         for sid in contrib:
             ctl = controls[sid]
-            v = ctl.snap_down(x[sid] * scale)
-            if v + tol < ctl.charge_min or v <= tol:
+            sign = 1.0 if x[sid] > 0 else -1.0
+            magnitude = ctl.snap_down(abs(x[sid]) * scale)
+            if magnitude + tol < ctl.minimum(x[sid]) or magnitude <= tol:
                 del x[sid]
             else:
-                x[sid] = v
+                x[sid] = sign * magnitude
 
 
 def trim_to_rows(
@@ -181,9 +202,12 @@ def trim_to_rows(
     """
     x = {sid: v for sid, v in setpoints.items() if v}
 
+    def spare(sid: str) -> float:
+        return abs(x[sid]) - controls[sid].minimum(x[sid])
+
     def key(sid: str) -> tuple[float, float, str]:
         r = 0.0 if rank is None else rank(sid, x[sid])
-        return (-r, -(x[sid] - controls[sid].charge_min), sid)
+        return (-r, -spare(sid), sid)
 
     while True:
         usage = constraints.usage(x)
@@ -193,13 +217,15 @@ def trim_to_rows(
         r = int(np.argmax(excess))
         if excess[r] <= tol:
             return x
-        contributors = [sid for sid in x if constraints.coefficient(sid)[r] > 0]
-        margin = [sid for sid in contributors if x[sid] - controls[sid].charge_min > tol]
+        contributors = [sid for sid in x if constraints.contribution(sid, x[sid])[r] > 0]
+        margin = [sid for sid in contributors if spare(sid) > tol]
         if not margin:
             del x[min(contributors, key=key)]
             continue
         sid = min(margin, key=key)
         ctl = controls[sid]
-        need = float(excess[r]) / float(constraints.coefficient(sid)[r])
-        cut = min(x[sid] - ctl.charge_min, ctl.snap_up(need))
-        x[sid] = max(ctl.charge_min, round(x[sid] - cut, 9))
+        sign = 1.0 if x[sid] > 0 else -1.0
+        per_unit = float(constraints.contribution(sid, sign)[r])
+        cut = min(spare(sid), ctl.snap_up(float(excess[r]) / per_unit))
+        magnitude = max(ctl.minimum(x[sid]), round(abs(x[sid]) - cut, 9))
+        x[sid] = sign * magnitude
