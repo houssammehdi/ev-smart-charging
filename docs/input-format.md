@@ -38,7 +38,47 @@ All session timestamps must use the same convention as `start` (all naive or all
 | `grid_limit_kw`            | number | -       | maximum import at the connection point (fuse/contract)   |
 | `chargers[].id`            | string | -       | unique charger id                                        |
 | `chargers[].max_power_kw`  | number | -       | maximum charger power                                    |
-| `chargers[].min_power_kw`  | number | 4.14    | lowest non-zero power; 6 A x 230 V x 3 per IEC 61851. Use 0 for chargers without a minimum |
+| `chargers[].min_power_kw`  | number | 4.14 (1.38 if `phases` is 1) | lowest non-zero power on aggregate sites: 6 A x 230 V x phases per IEC 61851. Use 0 for chargers without a minimum |
+
+## Phase-aware sites
+
+Add a `supply` block to `site` and the site is modelled per line, with setpoints in amperes per
+phase (see [phases.md](phases.md)):
+
+```jsonc
+"site": {
+  "grid_limit_kw": 40,                      // optional here: defaults to the fuse-equivalent power
+  "supply": {"grid": "IT", "line_limit_a": 80, "voltage_v": 230},
+  "chargers": [
+    {"id": "P1", "phases": 3, "rotation": "L2L3L1", "max_current_a": 32, "current_step_a": 1},
+    {"id": "P2", "phases": 1, "rotation": "L3L1", "max_current_a": 16}
+  ]
+}
+```
+
+| field                        | type   | default | meaning                                               |
+|------------------------------|--------|---------|-------------------------------------------------------|
+| `supply.grid`                | string | `TN`    | `TN` (230/400 V with neutral) or `IT` (230 V, no neutral) |
+| `supply.line_limit_a`        | number or 3 numbers | - | current limit of L1, L2, L3 (main fuse, breaker or contract) |
+| `supply.voltage_v`           | number | 230     | voltage across a single-phase load: line-to-neutral (TN) or line-to-line (IT) |
+| `chargers[].phases`          | int    | 3       | 1 or 3                                                |
+| `chargers[].rotation`        | string | identity | site line of each charger conductor: `L2L3L1`, or OCPP `STR`; single-phase chargers name one line (TN) or two (IT) |
+| `chargers[].max_current_a`   | number | from `max_power_kw` | per-phase current limit                   |
+| `chargers[].min_current_a`   | number | 6       | lowest non-zero current (IEC 61851)                   |
+| `chargers[].current_step_a`  | number | 0.1     | setpoint resolution (OCPP 1.6 limits carry one decimal); 0 = continuous |
+| `chargers[].max_power_kw`    | number | phases x 230 V x `max_current_a` | an additional power cap          |
+
+With a `supply`, the top level also accepts per-line currents. Lines that are left out carry 0 A.
+
+```jsonc
+"base_current_a": {"L1": <series>, "L2": <series>, "L3": <series>},   // non-EV load per line
+"pv_current_a":   {"L1": <series>, "L2": <series>, "L3": <series>}    // PV current per line
+```
+
+Without them, `base_load_kw` and `pv_kw` are converted to balanced three-phase currents at
+unity power factor. The kW series are always used for energy cost and the peak. The current
+series are used for the line limits. [`examples/garage-it.json`](../examples/garage-it.json) is
+a complete example.
 
 ## `tariff`
 
@@ -60,6 +100,14 @@ All session timestamps must use the same convention as `start` (all naive or all
 | `max_power_kw` | number | -                | EV limit on this connection (e.g. 3.7 for a single-phase 16 A car) |
 | `efficiency`   | number | 0.9              | grid-to-battery efficiency in (0, 1]                      |
 | `min_power_kw` | number | charger minimum  | EV-specific minimum, e.g. 1.38 for a single-phase car at 6 A |
+| `phases`       | int    | 3                | phases the on-board charger uses (phase-aware sites) |
+| `max_current_a`| number | from `max_power_kw` | per-phase current limit of the on-board charger (phase-aware sites) |
+
+On an aggregate site the charger's 4.14 kW default minimum is the 6 A minimum of a
+*three-phase* EV. A single-phase EV on such a charger can modulate from 1.38 kW, so give it
+`"min_power_kw": 1.38`. Otherwise it is treated as an on/off load at its maximum (the minimum is
+capped at the EV's maximum). Phase-aware sites have no such caveat: there the minimum is a
+current.
 
 The rounding is conservative: a session is only scheduled in steps during which the EV is plugged
 in for the whole step. A session shorter than one step after rounding is rejected with an error.
