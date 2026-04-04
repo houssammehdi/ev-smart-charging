@@ -12,7 +12,9 @@ Only guaranteed properties are asserted:
   regulariser, MPC recovers the offline optimum (Bellman's principle);
 * on phase-aware sites (TN and IT, any rotation, 1/2/3-phase EVs, any
   resolution) no line and no site row is ever exceeded by any policy, and
-  every setpoint is on the charger's grid and within its range.
+  every setpoint is on the charger's grid and within its range;
+* with bidirectional (V2G) sessions every battery stays within its bounds,
+  every row (including export rows) holds, and the same bounds apply.
 """
 
 from __future__ import annotations
@@ -26,7 +28,7 @@ from hypothesis import strategies as st
 
 from evcharge.electrical import GridType, Supply, three_phase_kw_per_a
 from evcharge.metrics import compute_metrics
-from evcharge.model import Charger, Horizon, Scenario, Session, Site, Tariff, on_grid
+from evcharge.model import V2G, Charger, Horizon, Scenario, Session, Site, Tariff, on_grid
 from evcharge.optim import relaxation_bound
 from evcharge.policies import (
     POLICY_FACTORIES,
@@ -308,4 +310,117 @@ def test_optimal_plan_bounds_its_replay_on_phase_sites(sc: Scenario) -> None:
     opt = OptimalSchedule()
     executed = compute_metrics(simulate(sc, opt)).penalised_cost_eur
     assert relaxation_bound(sc) <= executed + cost_tol(executed)
+    assert executed <= opt.solution.objective + cost_tol(executed)
+
+
+@st.composite
+def v2g_scenarios(draw: st.DrawFn, *, phases: bool = False) -> Scenario:
+    """Random sites where some chargers are bidirectional and some EVs have a V2G spec."""
+    sc = draw(phase_scenarios() if phases else scenarios())
+    chargers = tuple(
+        Charger(
+            c.id,
+            c.max_power_kw,
+            c.min_power_kw,
+            c.phases,
+            c.rotation,
+            c.max_current_a,
+            c.min_current_a,
+            c.current_step_a,
+            bidirectional=draw(st.booleans()),
+        )
+        for c in sc.site.chargers
+    )
+    sessions = []
+    for s in sc.sessions:
+        if draw(st.booleans()):
+            capacity = draw(st.floats(10.0, 80.0))
+            low = draw(st.floats(0.0, 0.3)) * capacity
+            high = draw(st.floats(0.7, 1.0)) * capacity
+            initial = draw(st.floats(low, high))
+            energy = min(s.energy_kwh, high - initial)
+            v2g = V2G(
+                capacity_kwh=capacity,
+                initial_kwh=initial,
+                min_kwh=low,
+                max_kwh=high,
+                max_discharge_kw=None if phases else draw(st.none() | st.floats(1.0, 22.0)),
+                max_discharge_current_a=draw(st.none() | st.floats(6.0, 32.0)) if phases else None,
+                discharge_efficiency=draw(st.floats(0.8, 1.0)),
+                degradation_eur_per_kwh=draw(st.sampled_from([0.0, 0.02, 0.1])),
+            )
+            sessions.append(
+                Session(
+                    s.id,
+                    s.charger_id,
+                    s.arrival_step,
+                    s.departure_step,
+                    max(0.0, energy),
+                    s.max_power_kw,
+                    s.efficiency,
+                    s.min_power_kw,
+                    s.phases,
+                    s.max_current_a,
+                    v2g=v2g,
+                )
+            )
+        else:
+            sessions.append(s)
+    export = draw(st.none() | st.floats(0.5, 40.0))
+    site = Site(sc.site.grid_limit_kw, chargers, sc.site.supply, export)
+    return sc.with_site(site).with_sessions(tuple(sessions))
+
+
+def check_v2g_run(sc: Scenario, policy: object) -> None:
+    res = simulate(sc, policy)  # type: ignore[arg-type]
+    assert res.violations == (), (policy, res.violations)
+    assert res.setpoint is not None
+    rows = sc.rows
+    for t in range(sc.horizon.n_steps):
+        usage = np.zeros(rows.n_rows)
+        for i, s in enumerate(sc.sessions):
+            x = float(res.setpoint[i, t])
+            if x > 0:
+                usage += sc.row_coefficients(s) * x
+            elif x < 0:
+                usage += sc.row_discharge_coefficients(s) * -x
+        assert np.all(usage <= rows.rhs[t] + TOL), (policy, t, usage, rows.rhs[t])
+    for i, s in enumerate(sc.sessions):
+        ctl = sc.control(s)
+        x = res.setpoint[i]
+        assert np.all(x >= -ctl.discharge_max - TOL)
+        assert all(on_grid(abs(float(v)), ctl.step) for v in x)
+        if s.v2g is None:
+            assert np.all(x >= 0.0)
+            assert res.delivered_kwh[i] <= s.energy_kwh + TOL
+        else:
+            assert res.battery_kwh is not None
+            window = res.battery_kwh[i, s.arrival_step : s.departure_step]
+            assert np.all(window >= s.v2g.min_kwh - TOL), (policy, window)
+            assert np.all(window <= s.v2g.ceiling_kwh + TOL), (policy, window)
+
+
+@PROPERTY_SETTINGS
+@given(v2g_scenarios())
+def test_v2g_policies_keep_batteries_and_rows(sc: Scenario) -> None:
+    for policy in all_policies():
+        check_v2g_run(sc, policy)
+
+
+@PROPERTY_SETTINGS
+@given(v2g_scenarios(phases=True))
+def test_v2g_on_phase_sites_keeps_batteries_and_lines(sc: Scenario) -> None:
+    for policy in all_policies():
+        check_v2g_run(sc, policy)
+
+
+@PROPERTY_SETTINGS
+@given(v2g_scenarios())
+def test_v2g_bounds_sandwich_every_policy(sc: Scenario) -> None:
+    bound = relaxation_bound(sc)
+    for policy in all_policies():
+        m = compute_metrics(simulate(sc, policy))  # type: ignore[arg-type]
+        assert bound <= m.penalised_cost_eur + cost_tol(bound), policy
+    opt = OptimalSchedule()
+    executed = compute_metrics(simulate(sc, opt)).penalised_cost_eur
     assert executed <= opt.solution.objective + cost_tol(executed)

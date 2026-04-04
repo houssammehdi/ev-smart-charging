@@ -82,7 +82,7 @@ class OptimalSchedule:
     def decide(self, obs: Observation) -> Mapping[str, float]:
         """Replay the pre-computed plan."""
         desired = {st.id: float(self._plan[st.id][obs.step]) for st in obs.sessions}
-        return finalize(obs, {sid: v for sid, v in desired.items() if v > 0.0})
+        return finalize(obs, {sid: v for sid, v in desired.items() if v != 0.0})
 
     def __repr__(self) -> str:
         return f"OptimalSchedule(strategy={self.strategy!r})"
@@ -93,19 +93,55 @@ DEFAULT_QUICK_CHARGE_WEIGHT = 0.002
 
 
 def flex_load(st: SessionState, obs: Observation) -> FlexLoad:
-    """A connected session as an optimiser load on the local horizon starting now."""
+    """A connected session as an optimiser load on the local horizon starting now.
+
+    Sessions with a V2G spec carry their battery state: the local problem
+    starts from the current battery energy and must reach the departure target.
+    """
     ctl = st.control
+    v2g = st.session.v2g
+    rows = obs.rows
+    if v2g is None or st.battery_kwh is None:
+        return FlexLoad(
+            id=st.id,
+            start=0,
+            end=st.steps_left,
+            energy_kwh=st.remaining_kwh,
+            charge_max=ctl.charge_max,
+            charge_min=ctl.charge_min,
+            kw_per_unit=ctl.kw_per_unit,
+            efficiency=st.session.efficiency,
+            rows=tuple(float(a) for a in rows.coefficient(st.id)),
+        )
+    target = v2g.initial_kwh + st.session.energy_kwh
     return FlexLoad(
         id=st.id,
         start=0,
         end=st.steps_left,
-        energy_kwh=st.remaining_kwh,
+        energy_kwh=target - st.battery_kwh,
         charge_max=ctl.charge_max,
         charge_min=ctl.charge_min,
         kw_per_unit=ctl.kw_per_unit,
         efficiency=st.session.efficiency,
-        rows=tuple(float(a) for a in obs.rows.coefficient(st.id)),
+        rows=tuple(float(a) for a in rows.coefficient(st.id)),
+        discharge_max=ctl.discharge_max,
+        discharge_min=ctl.discharge_min,
+        discharge_efficiency=v2g.discharge_efficiency,
+        discharge_rows=tuple(float(a) for a in rows.discharge_coefficient(st.id))
+        if ctl.can_discharge
+        else None,
+        battery=(st.battery_kwh, min(v2g.min_kwh, st.battery_kwh), v2g.ceiling_kwh),
+        degradation_eur_per_kwh=v2g.degradation_eur_per_kwh,
     )
+
+
+def active(obs: Observation) -> list[SessionState]:
+    """Sessions worth optimising now.
+
+    Those still short of their request, and every session that can discharge,
+    since it may still shave a peak and recharge.
+    """
+    return [st for st in obs.sessions if not st.is_satisfied or st.control.can_discharge]
 
 
 def spare_later(pending: list[SessionState], setpoint: FloatArray) -> dict[str, float]:
@@ -168,7 +204,7 @@ class ModelPredictiveControl(OnlinePolicy):
 
     def decide(self, obs: Observation) -> Mapping[str, float]:
         """Solve the problem over the known sessions and apply the first step."""
-        pending = obs.pending()
+        pending = active(obs)
         if not pending:
             return {}
         sc = self.scenario
@@ -195,7 +231,7 @@ class ModelPredictiveControl(OnlinePolicy):
         desired = {
             st.id: float(solution.setpoint[i, 0])
             for i, st in enumerate(pending)
-            if solution.setpoint[i, 0] > 0.0
+            if solution.setpoint[i, 0] != 0.0
         }
         return finalize(obs, desired, room_later=spare_later(pending, solution.setpoint))
 
