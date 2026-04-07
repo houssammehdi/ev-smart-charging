@@ -56,6 +56,10 @@ def describe_scenario(scenario: Scenario) -> str:
     if supply is not None:
         limits = "/".join(f"{v:.0f}" if v == round(v) else f"{v:.1f}" for v in supply.line_limit_a)
         extras.append(f"{supply.grid.value} {limits} A per line")
+    n_v2g = sum(s.v2g is not None for s in scenario.sessions)
+    if n_v2g:
+        two_way = "bidirectional" if scenario.site.bidirectional else "charge-only chargers"
+        extras.append(f"{n_v2g} V2G sessions ({two_way})")
     if scenario.pv.max() > 0:
         extras.append(f"PV peak {scenario.pv.max():.1f} kW")
     if scenario.base_load.max() > 0:
@@ -92,10 +96,16 @@ def format_table(comparison: Comparison) -> str:
 
     ``gap %`` is the penalised cost (total cost plus the unmet-energy penalty)
     above the LP-relaxation lower bound. Phase-aware scenarios get a ``line %``
-    column: the highest line current relative to its limit.
+    column: the highest line current relative to its limit. Scenarios with V2G
+    sessions get ``V2G kWh`` (energy discharged) and ``wear EUR`` (battery
+    degradation, included in ``total EUR``).
     """
     columns = list(_COLUMNS)
     phase = comparison.scenario.site.phase_aware
+    v2g = any(s.v2g is not None for s in comparison.scenario.sessions)
+    total_at = [name for name, _ in _COLUMNS].index("total EUR")
+    if v2g:
+        columns[total_at:total_at] = [("V2G kWh", ">"), ("wear EUR", ">")]
     if phase:
         columns.insert(len(columns) - 1, ("line %", ">"))
     rows = []
@@ -114,6 +124,8 @@ def format_table(comparison: Comparison) -> str:
             f"{m.capacity_utilisation_pct:.1f}",
             str(m.violations),
         ]
+        if v2g:
+            row[total_at:total_at] = [f"{m.discharged_kwh:.1f}", f"{m.degradation_cost_eur:.2f}"]
         if phase:
             row.insert(len(row) - 1, f"{m.max_line_loading_pct:.1f}")
         rows.append(row)

@@ -27,7 +27,9 @@ is a complete example. In short::
 Time series accept a number (constant), a list with one value per step, or an
 object ``{"resolution_minutes": m, "values": [...]}`` whose resolution is a
 multiple of the step (values are held constant within each interval).
-Arrivals are rounded up and departures down to the step grid.
+Arrivals are rounded up and departures down to the step grid. Phase-aware
+sites add ``site.supply``; bidirectional (V2G) sessions add
+``chargers[].bidirectional`` and ``sessions[].v2g``.
 """
 
 from __future__ import annotations
@@ -42,6 +44,7 @@ from evcharge.electrical import LINES, NOMINAL_VOLTAGE_V, GridType, Supply, Wiri
 from evcharge.model import (
     DEFAULT_CURRENT_STEP_A,
     MIN_POWER_3PH_KW,
+    V2G,
     Charger,
     FloatArray,
     Horizon,
@@ -68,6 +71,12 @@ def _num(value: object, where: str) -> float:
 def _int(value: object, where: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValidationError(f"{where}: expected an integer, got {value!r}")
+    return value
+
+
+def _bool(value: object, where: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValidationError(f"{where}: expected true or false, got {value!r}")
     return value
 
 
@@ -170,9 +179,43 @@ def _parse_charger(raw: object, where: str, phase_aware: bool) -> Charger:
             current_step_a=_num(
                 c.get("current_step_a", DEFAULT_CURRENT_STEP_A), f"{where}.current_step_a"
             ),
+            bidirectional=_bool(c.get("bidirectional", False), f"{where}.bidirectional"),
         )
     except ValidationError as exc:
         raise ValidationError(f"{where}: {exc}") from None
+
+
+_V2G_FIELDS = {
+    "capacity_kwh",
+    "initial_kwh",
+    "min_kwh",
+    "max_kwh",
+    "max_discharge_kw",
+    "max_discharge_current_a",
+    "discharge_efficiency",
+    "degradation_eur_per_kwh",
+}
+
+
+def _parse_v2g(raw: object, where: str) -> V2G:
+    v = _obj(raw, where)
+    unknown = sorted(set(v) - _V2G_FIELDS)
+    if unknown:
+        raise ValidationError(f"{where}: unknown field(s) {', '.join(unknown)}")
+    return V2G(
+        capacity_kwh=_num(_get(v, "capacity_kwh", where), f"{where}.capacity_kwh"),
+        initial_kwh=_num(_get(v, "initial_kwh", where), f"{where}.initial_kwh"),
+        min_kwh=_num(v.get("min_kwh", 0.0), f"{where}.min_kwh"),
+        max_kwh=_opt_num(v, "max_kwh", where),
+        max_discharge_kw=_opt_num(v, "max_discharge_kw", where),
+        max_discharge_current_a=_opt_num(v, "max_discharge_current_a", where),
+        discharge_efficiency=_num(
+            v.get("discharge_efficiency", 0.9), f"{where}.discharge_efficiency"
+        ),
+        degradation_eur_per_kwh=_num(
+            v.get("degradation_eur_per_kwh", 0.0), f"{where}.degradation_eur_per_kwh"
+        ),
+    )
 
 
 def _parse_session(raw: object, where: str, horizon: Horizon) -> Session:
@@ -180,6 +223,7 @@ def _parse_session(raw: object, where: str, horizon: Horizon) -> Session:
     arrival = _time(_get(s, "arrival", where), f"{where}.arrival")
     departure = _time(_get(s, "departure", where), f"{where}.departure")
     try:
+        v2g = None if s.get("v2g") is None else _parse_v2g(s["v2g"], f"{where}.v2g")
         return Session(
             id=_str(_get(s, "id", where), f"{where}.id"),
             charger_id=_str(_get(s, "charger", where), f"{where}.charger"),
@@ -191,6 +235,7 @@ def _parse_session(raw: object, where: str, horizon: Horizon) -> Session:
             min_power_kw=_opt_num(s, "min_power_kw", where),
             phases=_int(s.get("phases", 3), f"{where}.phases"),
             max_current_a=_opt_num(s, "max_current_a", where),
+            v2g=v2g,
         )
     except ValidationError as exc:
         raise ValidationError(f"{where}: {exc}") from None
@@ -232,7 +277,12 @@ def scenario_from_dict(data: object) -> Scenario:
         grid_limit = supply.fuse_equivalent_kw
     else:
         grid_limit = _num(_get(site_obj, "grid_limit_kw", "site"), "site.grid_limit_kw")
-    site = Site(grid_limit_kw=grid_limit, chargers=chargers, supply=supply)
+    site = Site(
+        grid_limit_kw=grid_limit,
+        chargers=chargers,
+        supply=supply,
+        export_limit_kw=_opt_num(site_obj, "export_limit_kw", "site"),
+    )
 
     tar = _obj(_get(root, "tariff", "scenario"), "tariff")
     export_raw = tar.get("export_price_eur_per_kwh")

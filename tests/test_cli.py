@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -138,3 +139,16 @@ def test_json_output_has_no_nan(capsys: pytest.CaptureFixture[str]) -> None:
     text = capsys.readouterr().out
     assert "NaN" not in text
     assert json.loads(text)["results"][0]["max_line_loading_pct"] is None
+
+
+def test_compare_with_v2g_reports_discharge_and_wear(capsys: pytest.CaptureFixture[str]) -> None:
+    args = ["compare", "--scenario", "residential", "--sessions", "4", "--v2g-share", "1"]
+    assert main([*args, "--degradation", "0.05", "--policies", "llf", "optimal"]) == 0
+    out = capsys.readouterr().out
+    assert "4 V2G sessions (bidirectional)" in out
+    lines = out.splitlines()
+    header = re.split(r"\s{2,}", next(line for line in lines if line.startswith("policy")))
+    at = header.index("V2G kWh")
+    assert header[at : at + 3] == ["V2G kWh", "wear EUR", "total EUR"]
+    llf = next(line for line in lines if line.startswith("llf")).split()
+    assert llf[at] == "0.0"  # heuristics never discharge

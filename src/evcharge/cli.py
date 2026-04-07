@@ -14,7 +14,12 @@ from evcharge.io import load_scenario
 from evcharge.model import Scenario, ValidationError
 from evcharge.optim import SolverError
 from evcharge.policies import POLICY_FACTORIES, Policy, make_policy
-from evcharge.scenarios import DEFAULT_DEMAND_CHARGE_EUR_PER_KW, PROFILES, generate
+from evcharge.scenarios import (
+    DEFAULT_DEGRADATION_EUR_PER_KWH,
+    DEFAULT_DEMAND_CHARGE_EUR_PER_KW,
+    PROFILES,
+    generate,
+)
 
 
 def _add_scenario_args(p: argparse.ArgumentParser) -> None:
@@ -64,6 +69,19 @@ def _add_scenario_args(p: argparse.ArgumentParser) -> None:
         type=float,
         default=None,
         help="share of single-phase EVs on phase-aware sites (default: per profile)",
+    )
+    g.add_argument(
+        "--v2g-share",
+        type=float,
+        default=0.0,
+        help="share of EVs with a battery model on a bidirectional charger (default 0)",
+    )
+    g.add_argument(
+        "--degradation",
+        type=float,
+        default=DEFAULT_DEGRADATION_EUR_PER_KWH,
+        help="battery wear of V2G EVs in EUR per kWh of throughput "
+        f"(default {DEFAULT_DEGRADATION_EUR_PER_KWH})",
     )
 
 
@@ -127,6 +145,8 @@ def _scenario_from_args(args: argparse.Namespace) -> Scenario:
         line_limit_a=args.line_limit,
         rotate_phases=not args.no_rotation,
         single_phase_share=args.single_phase_share,
+        v2g_share=args.v2g_share,
+        degradation_eur_per_kwh=args.degradation,
     )
 
 

@@ -170,3 +170,47 @@ def test_phase_errors_name_the_field(path: tuple[Any, ...], value: Any, match: s
     target[path[-1]] = value
     with pytest.raises(ValidationError, match=match):
         scenario_from_dict(doc)
+
+
+def test_v2g_fields() -> None:
+    doc = base_doc()
+    doc["site"]["export_limit_kw"] = 5
+    doc["site"]["chargers"][0]["bidirectional"] = True
+    doc["sessions"][0]["energy_kwh"] = 0
+    doc["sessions"][0]["v2g"] = {
+        "capacity_kwh": 60,
+        "initial_kwh": 30,
+        "min_kwh": 12,
+        "max_kwh": 54,
+        "max_discharge_kw": 7,
+        "degradation_eur_per_kwh": 0.04,
+    }
+    sc = scenario_from_dict(doc)
+    assert sc.site.export_limit == 5.0
+    assert sc.site.bidirectional
+    s = sc.sessions[0]
+    assert s.v2g is not None
+    assert (s.v2g.min_kwh, s.v2g.ceiling_kwh, s.v2g.discharge_efficiency) == (12.0, 54.0, 0.9)
+    assert s.target_kwh == 30.0
+    ctl = sc.control(s)
+    assert (ctl.discharge_min, ctl.discharge_max) == (4.14, 7.0)
+
+
+@pytest.mark.parametrize(
+    ("path", "value", "match"),
+    [
+        (("site", "chargers", 0, "bidirectional"), "yes", "true or false"),
+        (("site", "export_limit_kw"), -1, "export_limit_kw"),
+        (("sessions", 0, "v2g"), {"capacity_kwh": 60}, r"v2g: missing required field"),
+        (("sessions", 0, "v2g"), {"capacity_kwh": 60, "initial_kwh": 5, "soc": 1}, "unknown"),
+        (("sessions", 0, "v2g"), {"capacity_kwh": 60, "initial_kwh": 58}, "exceeds max_kwh"),
+    ],
+)
+def test_v2g_errors_name_the_field(path: tuple[Any, ...], value: Any, match: str) -> None:
+    doc = base_doc()
+    target: Any = doc
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = value
+    with pytest.raises(ValidationError, match=match):
+        scenario_from_dict(doc)

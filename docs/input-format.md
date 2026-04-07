@@ -40,6 +40,9 @@ All session timestamps must use the same convention as `start` (all naive or all
 | `chargers[].max_power_kw`  | number | -       | maximum charger power                                    |
 | `chargers[].min_power_kw`  | number | 4.14 (1.38 if `phases` is 1) | lowest non-zero power on aggregate sites: 6 A x 230 V x phases per IEC 61851. Use 0 for chargers without a minimum |
 
+Bidirectional chargers and the export limit are described under
+[Bidirectional (V2G) sessions](#bidirectional-v2g-sessions).
+
 ## Phase-aware sites
 
 Add a `supply` block to `site` and the site is modelled per line, with setpoints in amperes per
@@ -111,6 +114,44 @@ current.
 
 The rounding is conservative: a session is only scheduled in steps during which the EV is plugged
 in for the whole step. A session shorter than one step after rounding is rejected with an error.
+
+## Bidirectional (V2G) sessions
+
+A session discharges only if its charger is bidirectional **and** it carries a `v2g` block,
+which describes the battery (see [v2g.md](v2g.md) for the model and a study):
+
+```jsonc
+"site": {
+  "grid_limit_kw": 40,
+  "export_limit_kw": 20,                                   // optional, default grid_limit_kw
+  "chargers": [{"id": "CP1", "max_power_kw": 11, "bidirectional": true}]
+},
+"sessions": [
+  {"id": "EV1", "charger": "CP1", "arrival": "...", "departure": "...",
+   "energy_kwh": 10, "max_power_kw": 11,
+   "v2g": {"capacity_kwh": 64, "initial_kwh": 30, "min_kwh": 13, "max_kwh": 58,
+           "max_discharge_kw": 7.4, "discharge_efficiency": 0.9,
+           "degradation_eur_per_kwh": 0.04}}
+]
+```
+
+| field                        | type   | default | meaning                                                |
+|------------------------------|--------|---------|--------------------------------------------------------|
+| `site.export_limit_kw`       | number | `grid_limit_kw` | maximum export at the connection point; EV discharge may not push export above it |
+| `chargers[].bidirectional`   | bool   | false   | the charger can discharge an EV                        |
+| `v2g.capacity_kwh`           | number | -       | usable battery capacity                                |
+| `v2g.initial_kwh`            | number | -       | battery energy at arrival                              |
+| `v2g.min_kwh`                | number | 0       | floor the aggregator may discharge to (the driver's reserve) |
+| `v2g.max_kwh`                | number | `capacity_kwh` | ceiling while plugged in; charging stops there   |
+| `v2g.max_discharge_kw`       | number | charge limit | discharge power limit                             |
+| `v2g.max_discharge_current_a`| number | charge limit | discharge current limit per phase (phase-aware sites) |
+| `v2g.discharge_efficiency`   | number | 0.9     | battery-to-grid efficiency in (0, 1]                   |
+| `v2g.degradation_eur_per_kwh`| number | 0       | wear cost per kWh of battery throughput, both directions |
+
+With a `v2g` block, `energy_kwh` is the net energy to add: the EV must leave with at least
+`initial_kwh + energy_kwh`, which must not exceed `max_kwh`, and `energy_kwh` may be 0. The
+discharge minimum equals the charging minimum (6 A, or `min_power_kw`). The session's
+`efficiency` applies to charging, `discharge_efficiency` to discharging.
 
 ## Series
 

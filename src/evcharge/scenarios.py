@@ -20,13 +20,18 @@ The shapes are stylised but grounded in Nordic practice:
   balanced load reaches the kW limit. Chargers are installed with cyclic phase
   rotation unless ``rotate_phases=False``. All phase options are applied after
   the random draws, so they never change the sessions' times or energies.
+* **V2G** (``v2g_share > 0``): that share of the EVs get a battery model and a
+  bidirectional charger. Batteries are illustrative (40 to 77 kWh by EV type)
+  and arrive 30 to 70 % full; the aggregator may use the range from 20 % (the
+  driver's reserve) to 90 %. These draws come from a separate random stream,
+  so a scenario without V2G is unchanged.
 """
 
 from __future__ import annotations
 
 import math
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import TypedDict, Unpack
 
@@ -44,6 +49,7 @@ from evcharge.electrical import (
 from evcharge.model import (
     MIN_POWER_1PH_KW,
     MIN_POWER_3PH_KW,
+    V2G,
     Charger,
     FloatArray,
     Horizon,
@@ -71,6 +77,12 @@ class _EVType:
     share: float
     phases: int = 3
     max_current_a: float = 16.0
+    battery_kwh: float = 60.0
+
+
+DEFAULT_DEGRADATION_EUR_PER_KWH = 0.04
+"""Illustrative battery wear per kWh of throughput: about 120 EUR/kWh of pack cost
+spread over some 1,500 full cycles (3,000 kWh of throughput per kWh of capacity)."""
 
 
 ROTATIONS = ("L1L2L3", "L2L3L1", "L3L1L2")
@@ -181,7 +193,7 @@ def _ev_mix(types: tuple[_EVType, ...], single_phase_share: float | None) -> tup
         for i, w in zip(group, weights, strict=True):
             shares[i] = total * w / sum(weights)
     return tuple(
-        _EVType(t.max_power_kw, t.min_power_kw, shares[i], t.phases, t.max_current_a)
+        _EVType(t.max_power_kw, t.min_power_kw, shares[i], t.phases, t.max_current_a, t.battery_kwh)
         for i, t in enumerate(types)
     )
 
@@ -219,12 +231,12 @@ def _overnight_departure(
 
 
 _EV_MIX_AC = (
-    _EVType(11.0, MIN_POWER_3PH_KW, 0.65, 3, 16.0),
-    _EVType(3.7, MIN_POWER_1PH_KW, 0.15, 1, 16.0),
-    _EVType(22.0, MIN_POWER_3PH_KW, 0.20, 3, 32.0),
+    _EVType(11.0, MIN_POWER_3PH_KW, 0.65, 3, 16.0, 64.0),
+    _EVType(3.7, MIN_POWER_1PH_KW, 0.15, 1, 16.0, 40.0),
+    _EVType(22.0, MIN_POWER_3PH_KW, 0.20, 3, 32.0, 77.0),
 )
 
-_SINGLE_PHASE_VAN = _EVType(7.4, MIN_POWER_1PH_KW, 0.0, 1, 32.0)
+_SINGLE_PHASE_VAN = _EVType(7.4, MIN_POWER_1PH_KW, 0.0, 1, 32.0, 50.0)
 """Added to profiles without a single-phase EV when ``single_phase_share`` is set."""
 
 PROFILES: dict[str, _Profile] = {
@@ -256,8 +268,8 @@ PROFILES: dict[str, _Profile] = {
         energy_clip=(15.0, 90.0),
         charger_kw=22.0,
         ev_types=(
-            _EVType(22.0, MIN_POWER_3PH_KW, 0.5, 3, 32.0),
-            _EVType(11.0, MIN_POWER_3PH_KW, 0.5, 3, 16.0),
+            _EVType(22.0, MIN_POWER_3PH_KW, 0.5, 3, 32.0, 75.0),
+            _EVType(11.0, MIN_POWER_3PH_KW, 0.5, 3, 16.0, 50.0),
         ),
         base_profile="depot",
         base_peak_per_session_kw=0.5,
@@ -297,6 +309,8 @@ def generate(
     line_limit_a: float | None = None,
     rotate_phases: bool = True,
     single_phase_share: float | None = None,
+    v2g_share: float = 0.0,
+    degradation_eur_per_kwh: float = DEFAULT_DEGRADATION_EUR_PER_KWH,
 ) -> Scenario:
     """Generate a synthetic scenario.
 
@@ -319,6 +333,8 @@ def generate(
             (``L1L2L3``, ``L2L3L1``, ``L3L1L2``) instead of all ``L1L2L3``.
         single_phase_share: Override the share of single-phase EVs
             (phase-aware sites only).
+        v2g_share: Share of EVs with a battery model on a bidirectional charger.
+        degradation_eur_per_kwh: Battery wear cost of those EVs per kWh of throughput.
 
     Raises:
         ValidationError: for unknown kinds or invalid parameters.
@@ -332,6 +348,8 @@ def generate(
     grid_type = None if grid is None else GridType(grid)
     if grid_type is None and (line_limit_a is not None or single_phase_share is not None):
         raise ValidationError("line_limit_a and single_phase_share need a phase-aware grid")
+    if not 0.0 <= v2g_share <= 1.0:
+        raise ValidationError("v2g_share must be in [0, 1]")
     prof = PROFILES[kind]
     ev_types = _ev_mix(prof.ev_types, single_phase_share)
     rng = np.random.default_rng(seed)
@@ -434,6 +452,16 @@ def generate(
             )
         )
 
+    if v2g_share > 0.0:
+        sessions, chargers = _with_v2g(
+            sessions,
+            chargers,
+            [ev_types[int(i)] for i in type_idx],
+            seed,
+            v2g_share,
+            degradation_eur_per_kwh,
+        )
+
     base_peak = (
         base_load_peak_kw
         if base_load_peak_kw is not None
@@ -460,6 +488,40 @@ def generate(
     )
 
 
+def _with_v2g(
+    sessions: list[Session],
+    chargers: tuple[Charger, ...],
+    types: list[_EVType],
+    seed: int,
+    share: float,
+    degradation: float,
+) -> tuple[list[Session], tuple[Charger, ...]]:
+    """Give a share of the sessions a battery model and their chargers bidirectionality."""
+    rng = np.random.default_rng([seed, 2])  # separate stream: never shifts the main draws
+    chosen = rng.random(len(sessions)) < share
+    fill = rng.uniform(0.3, 0.7, len(sessions))
+    out: list[Session] = []
+    two_way: set[str] = set()
+    for s, ev, pick, soc in zip(sessions, types, chosen, fill, strict=True):
+        if not pick:
+            out.append(s)
+            continue
+        capacity = ev.battery_kwh
+        initial = round(float(soc) * capacity, 2)
+        ceiling = 0.9 * capacity
+        v2g = V2G(
+            capacity_kwh=capacity,
+            initial_kwh=initial,
+            min_kwh=0.2 * capacity,
+            max_kwh=ceiling,
+            discharge_efficiency=0.9,
+            degradation_eur_per_kwh=degradation,
+        )
+        out.append(replace(s, energy_kwh=round(min(s.energy_kwh, ceiling - initial), 2), v2g=v2g))
+        two_way.add(s.charger_id)
+    return out, tuple(replace(c, bidirectional=c.id in two_way) for c in chargers)
+
+
 class ScenarioOptions(TypedDict, total=False):
     """Keyword options shared by the scenario generators (see :func:`generate`)."""
 
@@ -474,6 +536,8 @@ class ScenarioOptions(TypedDict, total=False):
     line_limit_a: float | None
     rotate_phases: bool
     single_phase_share: float | None
+    v2g_share: float
+    degradation_eur_per_kwh: float
 
 
 def workplace(**options: Unpack[ScenarioOptions]) -> Scenario:

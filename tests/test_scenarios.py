@@ -137,3 +137,42 @@ def test_single_phase_share_and_rotation_options() -> None:
         scenarios.generate("workplace", line_limit_a=40.0)
     with pytest.raises(ValidationError, match=r"\[0, 1\]"):
         scenarios.generate("workplace", grid="TN", single_phase_share=1.5)
+
+
+def test_v2g_share_adds_batteries_without_shifting_the_draws() -> None:
+    plain = scenarios.generate("residential", n_sessions=40, seed=4)
+    v2g = scenarios.generate(
+        "residential", n_sessions=40, seed=4, v2g_share=0.5, degradation_eur_per_kwh=0.03
+    )
+    assert not plain.site.bidirectional
+    assert all(s.v2g is None for s in plain.sessions)
+    np.testing.assert_array_equal(v2g.tariff.price_eur_per_kwh, plain.tariff.price_eur_per_kwh)
+    two_way = {c.id for c in v2g.site.chargers if c.bidirectional}
+    n_v2g = 0
+    for p, s in zip(plain.sessions, v2g.sessions, strict=True):
+        assert (s.arrival_step, s.departure_step, s.charger_id) == (
+            p.arrival_step,
+            p.departure_step,
+            p.charger_id,
+        )
+        if s.v2g is None:
+            assert s.energy_kwh == p.energy_kwh
+            continue
+        n_v2g += 1
+        assert s.charger_id in two_way
+        b = s.v2g
+        assert b.min_kwh == pytest.approx(0.2 * b.capacity_kwh)
+        assert b.ceiling_kwh == pytest.approx(0.9 * b.capacity_kwh)
+        assert 0.3 * b.capacity_kwh - 0.01 <= b.initial_kwh <= 0.7 * b.capacity_kwh + 0.01
+        assert b.degradation_eur_per_kwh == 0.03
+        # the request is capped so that the departure target fits under the ceiling
+        assert s.energy_kwh <= p.energy_kwh
+        assert s.target_kwh is not None
+        assert s.target_kwh <= b.ceiling_kwh + 1e-9
+        assert v2g.control(s).can_discharge
+    assert 10 <= n_v2g <= 30
+    everyone = scenarios.generate("depot", n_sessions=10, seed=4, v2g_share=1.0, grid="TN")
+    assert all(s.v2g is not None for s in everyone.sessions)
+    assert everyone.rows.names[-1] == "site export"
+    with pytest.raises(ValidationError, match="v2g_share"):
+        scenarios.generate("workplace", v2g_share=1.5)
