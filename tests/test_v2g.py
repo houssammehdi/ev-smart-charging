@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -234,3 +235,17 @@ def test_v2g_validation() -> None:
         Session("A", "C1", 0, 4, 0.0, 10.0)
     assert v2g.ceiling_kwh == 36.0
     assert Session("A", "C1", 0, 4, 2.0, 10.0, v2g=v2g).target_kwh == 32.0
+
+
+def test_discharge_limit_defaults_to_the_charge_limit_on_phase_sites() -> None:
+    # regression: the EV's 16 A limit used to be ignored for discharge
+    v2g = V2G(capacity_kwh=40.0, initial_kwh=20.0)
+    chargers = [Charger("C1", 22.0, bidirectional=True), Charger("C2", 22.0, bidirectional=True)]
+    sessions = [
+        Session("A", "C1", 0, 2, 0.0, 22.0, max_current_a=16.0, v2g=v2g),
+        Session("B", "C2", 0, 2, 0.0, 22.0, v2g=replace(v2g, max_discharge_current_a=10.0)),
+    ]
+    sc = make_scenario(sessions, n_steps=2, chargers=chargers, supply=Supply.uniform(63.0))
+    a, b = (sc.control(s) for s in sc.sessions)
+    assert (a.charge_max, a.discharge_min, a.discharge_max) == (16.0, 6.0, 16.0)
+    assert (b.charge_max, b.discharge_max) == (pytest.approx(31.8), 10.0)

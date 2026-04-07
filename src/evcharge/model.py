@@ -411,7 +411,8 @@ class V2G:
         initial_kwh: Battery energy at arrival.
         min_kwh: Lowest energy the aggregator may discharge to (the driver's reserve).
         max_kwh: Highest energy while plugged in (``None``: the capacity); charging stops here.
-        max_discharge_kw: Discharge power limit in kW (``None``: the charge limit).
+        max_discharge_kw: Discharge power limit in kW (``None``: the charge
+            limit; discharge never exceeds the charge limit).
         max_discharge_current_a: Discharge current limit per phase on
             phase-aware sites (``None``: the charge limit).
         discharge_efficiency: Battery-to-grid efficiency in ``(0, 1]``; a
@@ -793,9 +794,12 @@ class Scenario:
             )
         d_min = d_max = 0.0
         if v2g is not None:
-            d_caps = [charger.max_power_kw / k]
-            d_caps += [c for c in (charger.max_current_a, v2g.max_discharge_current_a) if c]
-            d_caps += [] if v2g.max_discharge_kw is None else [v2g.max_discharge_kw / k]
+            # never above the charge limit (charger, cable and EV)
+            d_caps = [i_max]
+            if v2g.max_discharge_current_a is not None:
+                d_caps.append(v2g.max_discharge_current_a)
+            if v2g.max_discharge_kw is not None:
+                d_caps.append(v2g.max_discharge_kw / k)
             d_max = snap_down(min(d_caps), step)
             d_min = i_min
             if d_max + CURRENT_TOL_A < d_min:
