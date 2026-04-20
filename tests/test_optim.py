@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -13,6 +14,7 @@ from evcharge.optim import (
     _milp_bound,
     problem_from_scenario,
     relaxation_bound,
+    solve_scenarios,
     solve_schedule,
 )
 
@@ -174,3 +176,56 @@ def test_row_inputs_are_validated() -> None:
     short = RowModel(("a",), ("site",), np.ones((3, 1)))
     with pytest.raises(ValueError, match="cover 3 steps"):
         solve_schedule(problem((lp_session(1.0),), rows=short))
+
+
+KNOWN = FlexLoad("A", 0, 2, 10.0, 10.0)
+
+
+def two_step(*future: FlexLoad) -> ScheduleProblem:
+    """A known EV needing 10 kWh in two 1 h steps behind 10 kW; step 1 is cheaper."""
+    return ScheduleProblem(
+        dt_h=1.0,
+        price=np.array([0.2, 0.1]),
+        export_price=np.zeros(2),
+        net_base_kw=np.zeros(2),
+        grid_limit_kw=10.0,
+        demand_charge=0.0,
+        sessions=(KNOWN, *future),
+        min_power_steps=1,
+    )
+
+
+def test_one_scenario_is_the_plain_problem() -> None:
+    p = two_step(FlexLoad("B", 1, 2, 4.0, 10.0))
+    single = solve_schedule(p)
+    saa = solve_scenarios([p], n_shared=1)
+    np.testing.assert_allclose(saa.setpoint, single.setpoint, atol=1e-9)
+    assert saa.objective == pytest.approx(single.objective)
+
+
+def test_non_anticipativity_hedges_against_a_likely_arrival() -> None:
+    # A second EV arrives at step 1 with probability 1/2 and needs all 10 kW then.
+    arrival = FlexLoad("B", 1, 2, 10.0, 10.0)
+    # Without it the cheap step wins: charge A at step 1.
+    assert solve_schedule(two_step()).setpoint[0, 0] == pytest.approx(0.0)
+    # Sample average over "arrives" and "does not": 5 kWh of A left for step 1
+    # would be unmet with probability 1/2 at 100 EUR/kWh, so all 10 kWh go now.
+    saa = solve_scenarios([two_step(arrival), two_step()], n_shared=1)
+    assert saa.setpoint[0, 0] == pytest.approx(10.0)
+    assert saa.objective == pytest.approx(0.5 * (2.0 + 1.0) + 0.5 * 2.0)
+    # The certainty equivalent (half an EV) only moves half of A forward.
+    half = FlexLoad("B", 1, 2, 5.0, 5.0)
+    assert solve_schedule(two_step(half)).setpoint[0, 0] == pytest.approx(5.0)
+    # Weights are scenario probabilities: an unlikely arrival is not worth 0.1 EUR/kWh.
+    rare = solve_scenarios([two_step(arrival), two_step()], n_shared=1, weights=[1e-4, 1.0])
+    assert rare.setpoint[0, 0] == pytest.approx(0.0)
+
+
+def test_solve_scenarios_validates_its_input() -> None:
+    other = replace(two_step(), sessions=(replace(KNOWN, energy_kwh=5.0),))
+    with pytest.raises(ValueError, match="same 1 sessions"):
+        solve_scenarios([two_step(), other], n_shared=1)
+    with pytest.raises(ValueError, match="weights"):
+        solve_scenarios([two_step()], n_shared=1, weights=[0.5, 0.5])
+    with pytest.raises(ValueError, match="at least one"):
+        solve_scenarios([], n_shared=0)

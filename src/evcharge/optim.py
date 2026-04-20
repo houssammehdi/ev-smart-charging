@@ -54,13 +54,14 @@ priced like the overshoot.
 from __future__ import annotations
 
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from typing import Literal
 
 import numpy as np
 import numpy.typing as npt
 from scipy.optimize import Bounds, LinearConstraint, linprog, milp
-from scipy.sparse import coo_matrix, csr_matrix, hstack, vstack
+from scipy.sparse import block_diag, coo_matrix, csr_matrix, hstack, vstack
 
 from evcharge.model import POWER_TOL_KW, FloatArray, RowModel, Scenario, on_grid
 
@@ -356,7 +357,136 @@ def _floor_line_rows(rhs: FloatArray, kinds: tuple[str, ...], loads: list[FlexLo
     return out
 
 
-class _Model:
+class _Program:
+    """A (MI)LP whose first ``n_p`` columns are setpoints that may need binaries.
+
+    ``min c x`` subject to ``a_eq x = b_eq``, ``a_ub x <= b_ub`` and
+    ``lb <= x <= ub``. For setpoint column ``i``, ``p_min[i]`` and ``p_max[i]``
+    give its semi-continuous range, ``p_dir[i]`` is +1 (charging) or -1
+    (discharging) and ``partner[i]`` the opposite direction's column (-1: none).
+    """
+
+    c: FloatArray
+    a_eq: csr_matrix
+    b_eq: FloatArray
+    a_ub: csr_matrix
+    b_ub: FloatArray
+    lb: FloatArray
+    ub: FloatArray
+    n_cont: int
+    n_p: int
+    p_min: FloatArray
+    p_max: FloatArray
+    p_dir: FloatArray
+    partner: npt.NDArray[np.int64]
+
+    def solve(
+        self,
+        p_lb: FloatArray,
+        p_ub: FloatArray,
+        binaries: npt.NDArray[np.int64],
+        *,
+        time_limit_s: float | None,
+        mip_rel_gap: float,
+    ) -> tuple[FloatArray, float, float, str]:
+        """Solve with the given setpoint bounds; ``binaries`` index semi-continuous entries.
+
+        Returns ``(x, objective, lower_bound, status)``.
+        """
+        lb = self.lb.copy()
+        ub = self.ub.copy()
+        lb[: self.n_p] = p_lb
+        ub[: self.n_p] = p_ub
+        n_y = int(binaries.size)
+        if n_y == 0:
+            res = linprog(
+                self.c,
+                A_ub=self.a_ub,
+                b_ub=self.b_ub,
+                A_eq=self.a_eq,
+                b_eq=self.b_eq,
+                bounds=np.column_stack([lb, ub]),
+                method="highs",
+            )
+            if res.status != 0 or res.x is None:
+                raise SolverError(f"HiGHS LP failed: {res.message}")
+            return np.asarray(res.x, dtype=np.float64), float(res.fun), float(res.fun), "optimal"
+
+        # x_i - x_max y_i <= 0 and x_min y_i - x_i <= 0 for every binary entry i, and
+        # y+ + y- <= 1 for the two directions of a bidirectional charger.
+        n_var = self.n_cont + n_y
+        y_cols = self.n_cont + np.arange(n_y)
+        y_rows = np.arange(n_y)
+        position = np.full(self.n_p, -1, dtype=np.int64)
+        position[binaries] = np.arange(n_y)
+        charge_y = np.flatnonzero((self.p_dir[binaries] > 0) & (self.partner[binaries] >= 0))
+        pair_y = position[self.partner[binaries[charge_y]]]
+        charge_y, pair_y = charge_y[pair_y >= 0], pair_y[pair_y >= 0]
+        n_pair = int(charge_y.size)
+        pair_rows = 2 * n_y + np.arange(n_pair)
+        link = coo_matrix(
+            (
+                np.concatenate(
+                    [
+                        np.ones(n_y),
+                        -self.p_max[binaries],
+                        -np.ones(n_y),
+                        self.p_min[binaries],
+                        np.ones(2 * n_pair),
+                    ]
+                ),
+                (
+                    np.concatenate(
+                        [y_rows, y_rows, n_y + y_rows, n_y + y_rows, pair_rows, pair_rows]
+                    ),
+                    np.concatenate(
+                        [binaries, y_cols, binaries, y_cols, y_cols[charge_y], y_cols[pair_y]]
+                    ),
+                ),
+            ),
+            shape=(2 * n_y + n_pair, n_var),
+        )
+        pad = csr_matrix((self.a_eq.shape[0], n_y))
+        a_eq = hstack([self.a_eq, pad]).tocsr()
+        a_ub = vstack([hstack([self.a_ub, csr_matrix((self.a_ub.shape[0], n_y))]), link]).tocsr()
+        b_ub = np.concatenate([self.b_ub, np.zeros(2 * n_y), np.ones(n_pair)])
+        integrality = np.concatenate([np.zeros(self.n_cont), np.ones(n_y)])
+        # HiGHS presolve is disabled for MILPs: on some tiny instances its postsolve
+        # path re-runs the solver and prints debug output to stdout; the MILPs built
+        # here are small (MPC) or already reduced by the LP (relax-and-fix).
+        options: dict[str, float | bool] = {
+            "disp": False,
+            "presolve": False,
+            "mip_rel_gap": mip_rel_gap,
+        }
+        if time_limit_s is not None:
+            options["time_limit"] = time_limit_s
+        res = milp(
+            np.concatenate([self.c, np.zeros(n_y)]),
+            constraints=[
+                LinearConstraint(a_eq, self.b_eq, self.b_eq),
+                LinearConstraint(a_ub, -np.inf, b_ub),
+            ],
+            integrality=integrality,
+            bounds=Bounds(np.concatenate([lb, np.zeros(n_y)]), np.concatenate([ub, np.ones(n_y)])),
+            options=options,
+        )
+        if res.x is None or res.status not in (0, 1):
+            raise SolverError(f"HiGHS MILP failed: {res.message}")
+        x = np.asarray(res.x, dtype=np.float64)
+        on = x[self.n_cont :] > 0.5
+        p = x[binaries]
+        x[binaries] = np.where(on, np.maximum(p, self.p_min[binaries]), 0.0)
+        bound = _milp_bound(res)
+        return (
+            x[: self.n_cont],
+            float(res.fun),
+            bound,
+            "optimal" if res.status == 0 else "time_limit",
+        )
+
+
+class _Model(_Program):
     """Sparse matrices of one :class:`ScheduleProblem`, reusable across solves.
 
     Setpoint columns come first: the charging entries of every session, then
@@ -629,111 +759,6 @@ class _Model:
             [_snap(rhs).reshape(-1), np.zeros(n_t), -target[held], np.zeros(spill.size)]
         )
 
-    def solve(
-        self,
-        p_lb: FloatArray,
-        p_ub: FloatArray,
-        binaries: npt.NDArray[np.int64],
-        *,
-        time_limit_s: float | None,
-        mip_rel_gap: float,
-    ) -> tuple[FloatArray, float, float, str]:
-        """Solve with the given setpoint bounds; ``binaries`` index semi-continuous entries.
-
-        Returns ``(x, objective, lower_bound, status)``.
-        """
-        lb = self.lb.copy()
-        ub = self.ub.copy()
-        lb[: self.n_p] = p_lb
-        ub[: self.n_p] = p_ub
-        n_y = int(binaries.size)
-        if n_y == 0:
-            res = linprog(
-                self.c,
-                A_ub=self.a_ub,
-                b_ub=self.b_ub,
-                A_eq=self.a_eq,
-                b_eq=self.b_eq,
-                bounds=np.column_stack([lb, ub]),
-                method="highs",
-            )
-            if res.status != 0 or res.x is None:
-                raise SolverError(f"HiGHS LP failed: {res.message}")
-            return np.asarray(res.x, dtype=np.float64), float(res.fun), float(res.fun), "optimal"
-
-        # x_i - x_max y_i <= 0 and x_min y_i - x_i <= 0 for every binary entry i, and
-        # y+ + y- <= 1 for the two directions of a bidirectional charger.
-        n_var = self.n_cont + n_y
-        y_cols = self.n_cont + np.arange(n_y)
-        y_rows = np.arange(n_y)
-        position = np.full(self.n_p, -1, dtype=np.int64)
-        position[binaries] = np.arange(n_y)
-        charge_y = np.flatnonzero((self.p_dir[binaries] > 0) & (self.partner[binaries] >= 0))
-        pair_y = position[self.partner[binaries[charge_y]]]
-        charge_y, pair_y = charge_y[pair_y >= 0], pair_y[pair_y >= 0]
-        n_pair = int(charge_y.size)
-        pair_rows = 2 * n_y + np.arange(n_pair)
-        link = coo_matrix(
-            (
-                np.concatenate(
-                    [
-                        np.ones(n_y),
-                        -self.p_max[binaries],
-                        -np.ones(n_y),
-                        self.p_min[binaries],
-                        np.ones(2 * n_pair),
-                    ]
-                ),
-                (
-                    np.concatenate(
-                        [y_rows, y_rows, n_y + y_rows, n_y + y_rows, pair_rows, pair_rows]
-                    ),
-                    np.concatenate(
-                        [binaries, y_cols, binaries, y_cols, y_cols[charge_y], y_cols[pair_y]]
-                    ),
-                ),
-            ),
-            shape=(2 * n_y + n_pair, n_var),
-        )
-        pad = csr_matrix((self.a_eq.shape[0], n_y))
-        a_eq = hstack([self.a_eq, pad]).tocsr()
-        a_ub = vstack([hstack([self.a_ub, csr_matrix((self.a_ub.shape[0], n_y))]), link]).tocsr()
-        b_ub = np.concatenate([self.b_ub, np.zeros(2 * n_y), np.ones(n_pair)])
-        integrality = np.concatenate([np.zeros(self.n_cont), np.ones(n_y)])
-        # HiGHS presolve is disabled for MILPs: on some tiny instances its postsolve
-        # path re-runs the solver and prints debug output to stdout; the MILPs built
-        # here are small (MPC) or already reduced by the LP (relax-and-fix).
-        options: dict[str, float | bool] = {
-            "disp": False,
-            "presolve": False,
-            "mip_rel_gap": mip_rel_gap,
-        }
-        if time_limit_s is not None:
-            options["time_limit"] = time_limit_s
-        res = milp(
-            np.concatenate([self.c, np.zeros(n_y)]),
-            constraints=[
-                LinearConstraint(a_eq, self.b_eq, self.b_eq),
-                LinearConstraint(a_ub, -np.inf, b_ub),
-            ],
-            integrality=integrality,
-            bounds=Bounds(np.concatenate([lb, np.zeros(n_y)]), np.concatenate([ub, np.ones(n_y)])),
-            options=options,
-        )
-        if res.x is None or res.status not in (0, 1):
-            raise SolverError(f"HiGHS MILP failed: {res.message}")
-        x = np.asarray(res.x, dtype=np.float64)
-        on = x[self.n_cont :] > 0.5
-        p = x[binaries]
-        x[binaries] = np.where(on, np.maximum(p, self.p_min[binaries]), 0.0)
-        bound = _milp_bound(res)
-        return (
-            x[: self.n_cont],
-            float(res.fun),
-            bound,
-            "optimal" if res.status == 0 else "time_limit",
-        )
-
     def round_to_grid(
         self, x: FloatArray, *, time_limit_s: float | None, mip_rel_gap: float
     ) -> tuple[FloatArray, float, str, int]:
@@ -944,6 +969,100 @@ def solve_schedule(
             status = round_status
     solution = model.to_solution(x, obj, bound, status, n_y, time.perf_counter() - started)
     return replace(solution, n_rounding=n_z)
+
+
+def solve_scenarios(
+    problems: Sequence[ScheduleProblem],
+    *,
+    n_shared: int,
+    weights: Sequence[float] | None = None,
+    time_limit_s: float | None = None,
+    mip_rel_gap: float = 1e-6,
+) -> ScheduleSolution:
+    """Sample-average approximation: one first-step decision for several futures.
+
+    Every problem describes the same present and one possible future: its first
+    ``n_shared`` sessions are the connected EVs (identical in every problem),
+    the rest are that scenario's future arrivals. The stacked program minimises
+    the weighted sum of the scenario objectives subject to non-anticipativity:
+    the step-0 setpoints of the shared sessions are equal in every scenario,
+    while every later decision is scenario-specific recourse. The minimum-power
+    rule is enforced as ``problems[0].min_power_steps`` says; the other
+    scenarios' step-0 setpoints inherit it through the equality.
+
+    Args:
+        problems: One problem per scenario.
+        n_shared: Number of leading sessions common to all problems.
+        weights: Scenario probabilities (default: equal).
+        time_limit_s: HiGHS time limit.
+        mip_rel_gap: Relative MIP gap at which HiGHS stops.
+
+    Returns:
+        The plan of the first scenario, whose step-0 setpoints are the shared
+        decision; ``objective`` and ``lower_bound`` refer to the weighted sum.
+
+    Raises:
+        ValueError: if the problems do not share their first ``n_shared`` sessions.
+        SolverError: if HiGHS fails.
+    """
+    started = time.perf_counter()
+    if not problems:
+        raise ValueError("solve_scenarios needs at least one problem")
+    shared = problems[0].sessions[:n_shared]
+    if len(shared) != n_shared or any(p.sessions[:n_shared] != shared for p in problems):
+        raise ValueError(f"every problem must start with the same {n_shared} sessions")
+    w = np.full(len(problems), 1.0 / len(problems)) if weights is None else np.asarray(weights)
+    if w.shape != (len(problems),) or np.any(w < 0.0):
+        raise ValueError("weights must be one non-negative number per problem")
+    models = [_Model(problems[0])] + [_Model(replace(p, min_power_steps=0)) for p in problems[1:]]
+    first = models[0]
+    offsets = np.concatenate([[0], np.cumsum([m.n_cont for m in models])]).astype(np.int64)
+    link_a: list[int] = []
+    link_b: list[int] = []
+    for j in np.flatnonzero((first.p_sess < n_shared) & (first.p_time == 0)):
+        for i, m in enumerate(models[1:], start=1):
+            k = np.flatnonzero(
+                (m.p_sess == first.p_sess[j]) & (m.p_time == 0) & (m.p_dir == first.p_dir[j])
+            )
+            link_a.append(int(j))
+            link_b.append(int(offsets[i] + k[0]))
+    n_cols = int(offsets[-1])
+    n_link = len(link_a)
+    link = coo_matrix(
+        (
+            np.concatenate([np.ones(n_link), -np.ones(n_link)]),
+            (np.tile(np.arange(n_link), 2), np.concatenate([link_a, link_b])),
+        ),
+        shape=(n_link, n_cols),
+    )
+    upper = []
+    for m in models:
+        ub = m.ub.copy()
+        ub[: m.n_p] = m.p_max
+        upper.append(ub)
+    stacked = _Program()
+    stacked.c = np.concatenate([wi * m.c for wi, m in zip(w, models, strict=True)])
+    stacked.a_eq = vstack([block_diag([m.a_eq for m in models]), link]).tocsr()
+    stacked.b_eq = np.concatenate([*(m.b_eq for m in models), np.zeros(n_link)])
+    stacked.a_ub = block_diag([m.a_ub for m in models]).tocsr()
+    stacked.b_ub = np.concatenate([m.b_ub for m in models])
+    stacked.lb = np.concatenate([m.lb for m in models])
+    stacked.ub = np.concatenate(upper)
+    stacked.n_cont = n_cols
+    stacked.n_p = first.n_p
+    stacked.p_min, stacked.p_max = first.p_min, first.p_max
+    stacked.p_dir, stacked.partner = first.p_dir, first.partner
+    binaries = np.flatnonzero(first.eligible)
+    x, obj, bound, status = stacked.solve(
+        np.zeros(first.n_p),
+        first.p_max.copy(),
+        binaries,
+        time_limit_s=time_limit_s,
+        mip_rel_gap=mip_rel_gap,
+    )
+    return first.to_solution(
+        x[: first.n_cont], obj, bound, status, int(binaries.size), time.perf_counter() - started
+    )
 
 
 def flex_loads_from_scenario(scenario: Scenario) -> tuple[FlexLoad, ...]:
