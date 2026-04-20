@@ -17,6 +17,7 @@ See ``docs/theory.md`` for the mathematical statement. Decision variables:
 ``P``       peak import over the horizon (kW), ``P >= peak_floor``
 ``u``       unmet energy of session *s* (kWh), penalised
 ``o``       energy overshoot of session *s* (kWh); see below
+``w``       charge a full battery refuses in step *t* (kWh, battery side; see below)
 ``y``       binary on/off of each setpoint in step *t* (MILP only)
 ==========  =======================================================
 
@@ -44,7 +45,10 @@ addition at the most negative export price of the session's window (zero if no
 export price is negative), so that undrawn energy can never look like revenue.
 With that term the MILP objective is an upper bound on the cost the simulator
 measures when the plan is replayed, and the LP relaxation (no overshoot) is a
-lower bound.
+lower bound. A battery with a V2G spec stops accepting charge at its ceiling in
+the same way, so where the minimum is enforced its state equation may spill up
+to one minimum step: ``soc_t = ... - w_t`` with ``0 <= w_t <= eta x+_t dt``,
+priced like the overshoot.
 """
 
 from __future__ import annotations
@@ -433,13 +437,21 @@ class _Model:
         has_min[c_sess[c_elig]] = True
         has_min &= ~tracked
 
+        # A battery at its ceiling stops accepting charge (the battery management
+        # cuts off), so a minimum-current command may put less into it than
+        # commanded. The spill w (battery side, per tracked entry) is that part;
+        # like the overshoot it is only needed where the minimum is enforced.
+        soc_charge_col = np.flatnonzero(soc_mask)
+        spill_ub = np.where(c_elig[soc_charge_col], (eta * c_min * unit_kw)[soc_sess] * dt, 0.0)
+
         self.off_soc = n_p
         self.off_g = n_p + n_soc
         self.off_e = self.off_g + n_t
         self.off_peak = self.off_e + n_t
         self.off_u = self.off_peak + 1
         self.off_o = self.off_u + n_s
-        self.n_cont = self.off_o + n_s
+        self.off_w = self.off_o + n_s
+        self.n_cont = self.off_w + n_soc
 
         c = np.zeros(self.n_cont)
         c[:n_c] = (
@@ -460,7 +472,8 @@ class _Model:
             window_min_export = np.array(
                 [float(problem.export_price[s.start : s.end].min()) for s in sessions]
             )
-            c[self.off_o :] = np.maximum(0.0, -window_min_export) / eta
+            c[self.off_o : self.off_w] = np.maximum(0.0, -window_min_export) / eta
+            c[self.off_w :] = (np.maximum(0.0, -window_min_export) / eta)[soc_sess]
         self.c = _snap(c)
 
         lb = np.zeros(self.n_cont)
@@ -473,7 +486,8 @@ class _Model:
             tracked, np.maximum(0.0, target - batteries[:, 1]), energy
         )
         # Commanding the minimum to finish a request is allowed: the EV stops by itself.
-        ub[self.off_o :] = np.where(has_min, eta * c_min * unit_kw * dt, 0.0)
+        ub[self.off_o : self.off_w] = np.where(has_min, eta * c_min * unit_kw * dt, 0.0)
+        ub[self.off_w :] = spill_ub
         self.lb, self.ub = lb, ub
 
         cols_c = np.arange(n_c)
@@ -482,7 +496,7 @@ class _Model:
         # Equalities. Power balance (row t): sum k (x+ - x-) - g + e = -(base - pv).
         # Energy of charge-only sessions (row n_t + j): sum eta k x+ dt + u - o = E.
         # Battery of tracked sessions: soc_t - soc_{t-1} - eta k x+ dt + k x- dt / eta_d
-        # = initial (first step) or 0.
+        # + w_t = initial (first step) or 0.
         j_of = np.full(n_s, -1, dtype=np.int64)
         j_of[loose] = np.arange(loose.size)
         e_rows = c_sess[~tracked[c_sess]]
@@ -509,6 +523,7 @@ class _Model:
                 soc_row[~first],
                 soc_row_of_c[soc_mask],
                 d_soc_row,
+                soc_row,
             ]
         )
         cols = np.concatenate(
@@ -524,6 +539,7 @@ class _Model:
                 soc_col[:-1][~first[1:]] if n_soc else soc_col,
                 cols_c[soc_mask],
                 cols_d,
+                self.off_w + np.arange(n_soc),
             ]
         )
         vals = np.concatenate(
@@ -539,6 +555,7 @@ class _Model:
                 -np.ones(int(np.count_nonzero(~first))),
                 -eta[soc_sess] * unit_kw[soc_sess] * dt,
                 k_d * dt / eta_d[d_sess],
+                np.ones(n_soc),
             ]
         )
         n_eq = soc_base + n_soc
@@ -546,7 +563,8 @@ class _Model:
         soc_rhs = np.where(first, batteries[soc_sess, 0], 0.0)
         self.b_eq = _snap(np.concatenate([-problem.net_base_kw, energy[loose], soc_rhs]))
         # Inequalities. Capacity (row t * R + r): sum a x <= rhs[t, r]; peak: g - P <= 0;
-        # departure of tracked sessions: -soc_last - u <= -target.
+        # departure of tracked sessions: -soc_last - u <= -target; spill never exceeds
+        # the commanded charge: w - eta k x+ dt <= 0.
         coef = np.array(
             [s.rows if s.rows is not None else (1.0,) * n_rows for s in sessions], dtype=np.float64
         ).reshape(n_s, n_rows)
@@ -567,6 +585,8 @@ class _Model:
             last[-1] = True
             last[:-1] = soc_sess[:-1] != soc_sess[1:]
         dep_row = n_cap + n_t + np.arange(held.size)
+        spill = np.flatnonzero(spill_ub > 0.0)
+        spill_row = n_cap + n_t + held.size + np.arange(spill.size)
         rows = np.concatenate(
             [
                 c_time[nz_entry] * n_rows + nz_row,
@@ -575,6 +595,8 @@ class _Model:
                 n_cap + t_idx,
                 dep_row,
                 dep_row,
+                spill_row,
+                spill_row,
             ]
         )
         cols = np.concatenate(
@@ -585,6 +607,8 @@ class _Model:
                 np.full(n_t, self.off_peak),
                 soc_col[last],
                 self.off_u + held,
+                self.off_w + spill,
+                soc_charge_col[spill],
             ]
         )
         vals = np.concatenate(
@@ -595,11 +619,15 @@ class _Model:
                 -np.ones(n_t),
                 -np.ones(held.size),
                 -np.ones(held.size),
+                np.ones(spill.size),
+                -(eta * unit_kw)[soc_sess[spill]] * dt,
             ]
         )
-        n_ub = n_cap + n_t + held.size
+        n_ub = n_cap + n_t + held.size + spill.size
         self.a_ub = coo_matrix((vals, (rows, cols)), shape=(n_ub, self.n_cont)).tocsr()
-        self.b_ub = np.concatenate([_snap(rhs).reshape(-1), np.zeros(n_t), -target[held]])
+        self.b_ub = np.concatenate(
+            [_snap(rhs).reshape(-1), np.zeros(n_t), -target[held], np.zeros(spill.size)]
+        )
 
     def solve(
         self,

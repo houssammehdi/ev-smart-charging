@@ -249,3 +249,29 @@ def test_discharge_limit_defaults_to_the_charge_limit_on_phase_sites() -> None:
     a, b = (sc.control(s) for s in sc.sessions)
     assert (a.charge_max, a.discharge_min, a.discharge_max) == (16.0, 6.0, 16.0)
     assert (b.charge_max, b.discharge_max) == (pytest.approx(31.8), 10.0)
+
+
+@pytest.mark.parametrize("policy", [OptimalSchedule(), ModelPredictiveControl()])
+def test_minimum_current_may_top_up_a_battery_near_its_ceiling(policy: object) -> None:
+    # regression: 0.05 kWh short of the target and 0.1 kWh below the ceiling, the
+    # EV could not be charged at the 1 kW minimum (1 kWh per step) because the
+    # plan kept the battery under its ceiling; the battery management stops it at
+    # the ceiling instead, so commanding the minimum reaches the target.
+    v2g = V2G(capacity_kwh=20.0, initial_kwh=17.9, max_kwh=18.0)
+    sc = make_scenario(
+        [Session("A", "C1", 0, 1, 0.05, 10.0, efficiency=1.0, v2g=v2g)],
+        n_steps=1,
+        chargers=[Charger("C1", 10.0, 1.0, bidirectional=True)],
+    )
+    res = simulate(sc, policy)  # type: ignore[arg-type]
+    assert res.violations == ()
+    assert res.setpoint is not None
+    assert res.setpoint[0, 0] == pytest.approx(1.0)
+    assert res.battery_kwh is not None
+    assert res.battery_kwh[0, 0] == pytest.approx(18.0)
+    m = compute_metrics(res)
+    assert m.unmet_kwh == pytest.approx(0.0, abs=1e-9)
+    assert m.energy_cost_eur == pytest.approx(0.1 * 0.1)
+    if isinstance(policy, OptimalSchedule):
+        # the plan pays for the whole commanded kWh: an upper bound on the replay
+        assert policy.solution.objective == pytest.approx(0.1)
