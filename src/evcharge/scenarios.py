@@ -540,6 +540,28 @@ class ScenarioOptions(TypedDict, total=False):
     degradation_eur_per_kwh: float
 
 
+TRAINING_SEED_BASE = 1_000_000
+"""Seeds from here on are reserved for training days (the history of a forecast)."""
+
+
+def training_days(
+    kind: str, n_days: int = 20, **options: Unpack[ScenarioOptions]
+) -> list[Scenario]:
+    """History for an arrival forecast: ``n_days`` days of the same kind and options.
+
+    Day ``i`` uses seed ``TRAINING_SEED_BASE + i``, so the history never
+    contains a test day generated with a seed below :data:`TRAINING_SEED_BASE`.
+    """
+    if n_days < 1:
+        raise ValidationError("n_days must be >= 1")
+    days = []
+    for i in range(n_days):
+        day = ScenarioOptions(**options)
+        day["seed"] = TRAINING_SEED_BASE + i
+        days.append(generate(kind, **day))
+    return days
+
+
 def workplace(**options: Unpack[ScenarioOptions]) -> Scenario:
     """Office car park: morning arrivals, about 8 h dwell (see :func:`generate`)."""
     return generate("workplace", **options)

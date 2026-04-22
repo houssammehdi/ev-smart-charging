@@ -176,3 +176,14 @@ def test_v2g_share_adds_batteries_without_shifting_the_draws() -> None:
     assert everyone.rows.names[-1] == "site export"
     with pytest.raises(ValidationError, match="v2g_share"):
         scenarios.generate("workplace", v2g_share=1.5)
+
+
+def test_training_days_use_reserved_seeds() -> None:
+    days = scenarios.training_days("depot", 3, n_sessions=5, seed=4)
+    assert len(days) == 3
+    expected = scenarios.generate("depot", n_sessions=5, seed=scenarios.TRAINING_SEED_BASE + 2)
+    assert days[2].sessions == expected.sessions
+    # the seed option is ignored: a history never contains the test day
+    assert days[0].sessions != scenarios.generate("depot", n_sessions=5, seed=4).sessions
+    with pytest.raises(ValidationError, match="n_days"):
+        scenarios.training_days("depot", 0)
