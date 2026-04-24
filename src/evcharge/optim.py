@@ -987,8 +987,11 @@ def solve_scenarios(
     the weighted sum of the scenario objectives subject to non-anticipativity:
     the step-0 setpoints of the shared sessions are equal in every scenario,
     while every later decision is scenario-specific recourse. The minimum-power
-    rule is enforced as ``problems[0].min_power_steps`` says; the other
-    scenarios' step-0 setpoints inherit it through the equality.
+    rule is enforced with binaries on the entries of the first problem (as its
+    ``min_power_steps`` says); the other scenarios' step-0 setpoints inherit it
+    through the equality, and their later entries are relaxed. Every problem
+    keeps its own overshoot allowance, so a shared minimum-current command that
+    finishes a request is feasible in every scenario.
 
     Args:
         problems: One problem per scenario.
@@ -1014,7 +1017,7 @@ def solve_scenarios(
     w = np.full(len(problems), 1.0 / len(problems)) if weights is None else np.asarray(weights)
     if w.shape != (len(problems),) or np.any(w < 0.0):
         raise ValueError("weights must be one non-negative number per problem")
-    models = [_Model(problems[0])] + [_Model(replace(p, min_power_steps=0)) for p in problems[1:]]
+    models = [_Model(p) for p in problems]
     first = models[0]
     offsets = np.concatenate([[0], np.cumsum([m.n_cont for m in models])]).astype(np.int64)
     link_a: list[int] = []

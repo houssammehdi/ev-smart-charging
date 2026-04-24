@@ -229,3 +229,21 @@ def test_solve_scenarios_validates_its_input() -> None:
         solve_scenarios([two_step()], n_shared=1, weights=[0.5, 0.5])
     with pytest.raises(ValueError, match="at least one"):
         solve_scenarios([], n_shared=0)
+
+
+def test_identical_scenarios_give_the_single_problem() -> None:
+    # regression: scenarios after the first lost the overshoot allowance, so a shared
+    # minimum-current command that finishes a request looked infeasible there
+    last = replace(
+        two_step(),
+        price=np.array([0.1]),
+        export_price=np.zeros(1),
+        net_base_kw=np.zeros(1),
+        sessions=(FlexLoad("A", 0, 1, 0.5, 11.0, charge_min=4.0),),
+    )
+    alone = solve_schedule(last)
+    assert alone.setpoint[0, 0] == pytest.approx(4.0)  # the EV stops by itself when full
+    stacked = solve_scenarios([last, last, last], n_shared=1)
+    assert stacked.setpoint[0, 0] == pytest.approx(4.0)
+    assert stacked.objective == pytest.approx(alone.objective)
+    assert stacked.unmet_kwh[0] == pytest.approx(0.0)
