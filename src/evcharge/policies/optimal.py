@@ -6,7 +6,7 @@ from collections.abc import Mapping
 
 import numpy as np
 
-from evcharge.model import FloatArray, Scenario
+from evcharge.model import FloatArray, RowModel, Scenario
 from evcharge.optim import (
     DEFAULT_UNMET_PENALTY_EUR_PER_KWH,
     FlexLoad,
@@ -207,33 +207,82 @@ class ModelPredictiveControl(OnlinePolicy):
         pending = active(obs)
         if not pending:
             return {}
-        sc = self.scenario
-        k = obs.step
-        end = max(st.session.departure_step for st in pending)
-        # Steps after the last known departure only carry the (forecast) base
-        # load; their import still sets a floor for the horizon's peak.
-        later_base_peak = float(sc.net_base_kw[end:].max(initial=0.0))
-        problem = ScheduleProblem(
-            dt_h=sc.horizon.dt_h,
-            price=sc.tariff.price_eur_per_kwh[k:end],
-            export_price=sc.tariff.export_price[k:end],
-            net_base_kw=sc.net_base_kw[k:end],
-            grid_limit_kw=sc.site.grid_limit_kw,
-            demand_charge=sc.tariff.demand_charge_eur_per_kw,
-            sessions=tuple(flex_load(st, obs) for st in pending),
-            peak_floor_kw=max(obs.peak_import_kw, later_base_peak),
-            unmet_penalty=self.unmet_penalty,
-            min_power_steps=1,
-            quick_charge_weight=self.quick_charge_weight,
-            rows=slice_rows(sc.rows, k, end),
-        )
-        solution = solve_schedule(problem)
+        solution = self.plan(obs, pending)
         desired = {
             st.id: float(solution.setpoint[i, 0])
             for i, st in enumerate(pending)
             if solution.setpoint[i, 0] != 0.0
         }
         return finalize(obs, desired, room_later=spare_later(pending, solution.setpoint))
+
+    def plan(self, obs: Observation, pending: list[SessionState]) -> ScheduleSolution:
+        """Solve the local problem of this step.
+
+        The first ``len(pending)`` rows of the solution are the connected
+        sessions, in order. Forecast-aware subclasses add future sessions.
+        """
+        return solve_schedule(self.local_problem(obs, pending))
+
+    def local_problem(
+        self,
+        obs: Observation,
+        pending: list[SessionState],
+        *,
+        future: tuple[FlexLoad, ...] = (),
+        end: int | None = None,
+        reserve_kw: FloatArray | None = None,
+        reserve_usage: FloatArray | None = None,
+    ) -> ScheduleProblem:
+        """The scheduling problem from the current step to the local horizon's end.
+
+        Args:
+            obs: The observation of the current step.
+            pending: Connected sessions to schedule (see :func:`active`).
+            future: Forecast sessions on the local horizon, placed after
+                ``pending``; they must not start before local step 1.
+            end: End of the local horizon (absolute, exclusive); at least the
+                last known departure.
+            reserve_kw: Load reserved for future arrivals per absolute step
+                (kW); in the steps after the current one it is added to the
+                base load.
+            reserve_usage: What that reserve uses of every row, shape
+                ``(n_steps, n_rows)`` over absolute steps; in the steps after the
+                current one it is taken out of the rows' capacity.
+        """
+        sc = self.scenario
+        k = obs.step
+        stop = max(st.session.departure_step for st in pending)
+        if end is not None:
+            stop = max(stop, end)
+        net = sc.net_base_kw[k:stop].copy()
+        rows = slice_rows(sc.rows, k, stop)
+        # Steps after the local horizon only carry the (forecast) base load; their
+        # import still sets a floor for the horizon's peak.
+        later = sc.net_base_kw[stop:]
+        if reserve_kw is not None:
+            shift = np.asarray(reserve_kw, dtype=np.float64).copy()
+            shift[: k + 1] = 0.0
+            net += shift[k:stop]
+            later = later + shift[stop:]
+        if reserve_usage is not None:
+            usage = np.asarray(reserve_usage, dtype=np.float64).copy()
+            usage[: k + 1] = 0.0
+            rows = RowModel(rows.names, rows.kinds, np.maximum(0.0, rows.rhs - usage[k:stop]))
+        later_base_peak = float(later.max(initial=0.0))
+        return ScheduleProblem(
+            dt_h=sc.horizon.dt_h,
+            price=sc.tariff.price_eur_per_kwh[k:stop],
+            export_price=sc.tariff.export_price[k:stop],
+            net_base_kw=net,
+            grid_limit_kw=sc.site.grid_limit_kw,
+            demand_charge=sc.tariff.demand_charge_eur_per_kw,
+            sessions=(*(flex_load(st, obs) for st in pending), *future),
+            peak_floor_kw=max(obs.peak_import_kw, later_base_peak),
+            unmet_penalty=self.unmet_penalty,
+            min_power_steps=1,
+            quick_charge_weight=self.quick_charge_weight,
+            rows=rows,
+        )
 
     def __repr__(self) -> str:
         return f"ModelPredictiveControl(quick_charge_weight={self.quick_charge_weight})"

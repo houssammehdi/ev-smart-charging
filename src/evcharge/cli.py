@@ -10,15 +10,18 @@ from collections.abc import Sequence
 
 from evcharge import __version__
 from evcharge.experiment import Comparison, compare, describe_scenario, format_table
+from evcharge.forecast import ArrivalForecast
 from evcharge.io import load_scenario
 from evcharge.model import Scenario, ValidationError
 from evcharge.optim import SolverError
-from evcharge.policies import POLICY_FACTORIES, Policy, make_policy
+from evcharge.policies import FORECAST_POLICY_FACTORIES, POLICY_FACTORIES, Policy, make_policy
 from evcharge.scenarios import (
     DEFAULT_DEGRADATION_EUR_PER_KWH,
     DEFAULT_DEMAND_CHARGE_EUR_PER_KW,
     PROFILES,
+    ScenarioOptions,
     generate,
+    training_days,
 )
 
 
@@ -86,14 +89,27 @@ def _add_scenario_args(p: argparse.ArgumentParser) -> None:
 
 
 def _add_policy_args(p: argparse.ArgumentParser, default: Sequence[str]) -> None:
+    names = [*POLICY_FACTORIES, *FORECAST_POLICY_FACTORIES]
     p.add_argument(
         "--policies",
         nargs="+",
-        choices=list(POLICY_FACTORIES),
+        choices=names,
         default=list(default),
         metavar="POLICY",
-        help=f"policies to run (choices: {', '.join(POLICY_FACTORIES)}; "
-        f"default: {' '.join(default)})",
+        help=f"policies to run (choices: {', '.join(names)}; default: {' '.join(default)})",
+    )
+    g = p.add_argument_group("forecast (mpc-reserve, mpc-ev, mpc-saa)")
+    g.add_argument(
+        "--train-days",
+        type=int,
+        default=20,
+        help="synthetic training days for the forecast (seeds from 1000000; default 20)",
+    )
+    g.add_argument(
+        "--history",
+        nargs="+",
+        metavar="FILE",
+        help="past days as scenario JSON files to learn the forecast from",
     )
 
 
@@ -129,11 +145,8 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _scenario_from_args(args: argparse.Namespace) -> Scenario:
-    if getattr(args, "input", None):
-        return load_scenario(args.input)
-    return generate(
-        args.scenario,
+def _options(args: argparse.Namespace) -> ScenarioOptions:
+    return ScenarioOptions(
         n_sessions=args.sessions,
         seed=args.seed,
         grid_limit_kw=args.grid_limit,
@@ -150,8 +163,25 @@ def _scenario_from_args(args: argparse.Namespace) -> Scenario:
     )
 
 
-def _policies(names: Sequence[str]) -> list[Policy]:
-    return [make_policy(n) for n in names]
+def _scenario_from_args(args: argparse.Namespace) -> Scenario:
+    if getattr(args, "input", None):
+        return load_scenario(args.input)
+    return generate(args.scenario, **_options(args))
+
+
+def _forecast(args: argparse.Namespace) -> ArrivalForecast:
+    """The forecast of the forecast-aware policies: from --history, else synthetic days."""
+    if args.history:
+        return ArrivalForecast.fit([load_scenario(f) for f in args.history])
+    if getattr(args, "input", None):
+        raise ValidationError("forecast-aware policies need --history for a scenario file")
+    return ArrivalForecast.fit(training_days(args.scenario, args.train_days, **_options(args)))
+
+
+def _policies(args: argparse.Namespace) -> list[Policy]:
+    names: Sequence[str] = args.policies
+    forecast = _forecast(args) if any(n in FORECAST_POLICY_FACTORIES for n in names) else None
+    return [make_policy(n, forecast) for n in names]
 
 
 def _json_value(value: float | int | str) -> float | int | str | None:
@@ -186,7 +216,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         scenario = _scenario_from_args(args)
-        policies = _policies(args.policies)
+        policies = _policies(args)
         if args.command == "plot":
             from evcharge.plotting import save_power_plot
             from evcharge.sim import simulate

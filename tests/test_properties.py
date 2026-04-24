@@ -14,7 +14,9 @@ Only guaranteed properties are asserted:
   resolution) no line and no site row is ever exceeded by any policy, and
   every setpoint is on the charger's grid and within its range;
 * with bidirectional (V2G) sessions every battery stays within its bounds,
-  every row (including export rows) holds, and the same bounds apply.
+  every row (including export rows) holds, and the same bounds apply;
+* the forecast-aware MPC variants are as safe as the other policies and
+  bounded by the LP relaxation, whatever the forecast.
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
 from evcharge.electrical import GridType, Supply, three_phase_kw_per_a
+from evcharge.forecast import ArrivalForecast
 from evcharge.metrics import compute_metrics
 from evcharge.model import V2G, Charger, Horizon, Scenario, Session, Site, Tariff, on_grid
 from evcharge.optim import relaxation_bound
@@ -35,6 +38,7 @@ from evcharge.policies import (
     ModelPredictiveControl,
     OptimalSchedule,
 )
+from evcharge.policies.forecast import ExpectedValueMPC, ReserveMPC, ScenarioMPC
 from evcharge.sim import simulate
 
 TOL = 1e-6
@@ -424,3 +428,18 @@ def test_v2g_bounds_sandwich_every_policy(sc: Scenario) -> None:
     opt = OptimalSchedule()
     executed = compute_metrics(simulate(sc, opt)).penalised_cost_eur
     assert executed <= opt.solution.objective + cost_tol(executed)
+
+
+@PROPERTY_SETTINGS
+@given(
+    st.one_of(scenarios(), phase_scenarios(), v2g_scenarios(), v2g_scenarios(phases=True)),
+    st.sampled_from([None, 0.0, 3.0]),
+)
+def test_forecast_mpc_is_safe_and_bounded(sc: Scenario, bandwidth: float | None) -> None:
+    # the scenario's own sessions as the "history": any forecast must keep every limit
+    fc = ArrivalForecast.fit([sc], bandwidth_steps=bandwidth)
+    bound = relaxation_bound(sc)
+    for policy in (ExpectedValueMPC(fc), ReserveMPC(fc), ScenarioMPC(fc, n_scenarios=2)):
+        check_v2g_run(sc, policy)
+        m = compute_metrics(simulate(sc, policy))
+        assert bound <= m.penalised_cost_eur + cost_tol(bound), policy

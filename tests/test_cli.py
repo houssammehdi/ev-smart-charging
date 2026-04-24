@@ -152,3 +152,18 @@ def test_compare_with_v2g_reports_discharge_and_wear(capsys: pytest.CaptureFixtu
     assert header[at : at + 3] == ["V2G kWh", "wear EUR", "total EUR"]
     llf = next(line for line in lines if line.startswith("llf")).split()
     assert llf[at] == "0.0"  # heuristics never discharge
+
+
+def test_forecast_policies_learn_from_training_days_or_history(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    args = ["compare", "--sessions", "4", "--step-minutes", "60", "--train-days", "2"]
+    assert main([*args, "--policies", "mpc-ev", "mpc-reserve", "mpc-saa"]) == 0
+    out = capsys.readouterr().out
+    assert all(f"\n{name} " in out for name in ("mpc-ev", "mpc-reserve", "mpc-saa"))
+    # a scenario file has no synthetic history: --history is required
+    assert main(["run", "--input", str(EXAMPLE), "--policies", "mpc-ev"]) == 2
+    assert "need --history" in capsys.readouterr().err
+    history = ["--history", str(EXAMPLE), str(EXAMPLE)]
+    assert main(["run", "--input", str(EXAMPLE), "--policies", "mpc-reserve", *history]) == 0
+    assert "\nmpc-reserve " in capsys.readouterr().out

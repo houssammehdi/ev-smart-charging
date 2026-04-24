@@ -5,10 +5,12 @@ import pytest
 
 from evcharge.capacity import StepConstraints
 from evcharge.electrical import Supply
+from evcharge.forecast import ArrivalForecast
 from evcharge.metrics import compute_metrics
 from evcharge.model import Charger, Control, Session
 from evcharge.optim import relaxation_bound
 from evcharge.policies import (
+    FORECAST_POLICY_FACTORIES,
     POLICY_FACTORIES,
     EarliestDeadlineFirst,
     EqualShare,
@@ -244,6 +246,11 @@ def test_registry() -> None:
         assert repr(p)
     with pytest.raises(ValueError, match="unknown policy"):
         make_policy("magic")
+    forecast = ArrivalForecast.fit([make_scenario([session("A", "C1", 0, 4, 5.0)])])
+    for name in FORECAST_POLICY_FACTORIES:
+        assert make_policy(name, forecast).name == name
+        with pytest.raises(ValueError, match="needs an arrival forecast"):
+            make_policy(name)
     with pytest.raises(RuntimeError):
         _ = Uncontrolled().scenario
     with pytest.raises(RuntimeError):
