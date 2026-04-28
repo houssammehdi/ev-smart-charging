@@ -1,0 +1,26 @@
+{
+  "site": {
+    "supply": {"grid": "TN", "line_limit_a": 40},
+    "chargers": [
+      {"id": "CP001/1", "phases": 3, "rotation": "L1L2L3", "max_current_a": 16},
+      {"id": "CP002/1", "phases": 3, "rotation": "L2L3L1", "max_current_a": 16},
+      {"id": "CP003/1", "phases": 3, "rotation": "L3L1L2", "max_current_a": 16}
+    ]
+  },
+  "charger_template": {"phases": 3, "max_current_a": 16, "current_step_a": 1},
+  "tariff": {
+    "price_eur_per_kwh": [0.12, 0.11, 0.10, 0.10, 0.10, 0.11, 0.14, 0.18, 0.20, 0.17, 0.14, 0.12,
+                          0.11, 0.11, 0.12, 0.14, 0.17, 0.22, 0.24, 0.21, 0.17, 0.15, 0.14, 0.13],
+    "demand_charge_eur_per_kw": 0.3
+  },
+  "base_load_kw": 3.0,
+  "control": {"policy": "llf", "interval_s": 60, "step_minutes": 15, "horizon_hours": 24},
+  "heartbeat_s": 300,
+  "session_defaults": {"energy_kwh": 20, "dwell_hours": 8, "phases": 3, "max_power_kw": 11,
+                       "efficiency": 0.9},
+  "id_tags": {
+    "ALICE": {"energy_kwh": 30, "departure": "07:30"},
+    "BOB": {"energy_kwh": 12, "dwell_hours": 4, "phases": 1, "max_power_kw": 3.7}
+  },
+  "accept_unknown_tags": true
+}

@@ -1,4 +1,4 @@
-"""Command-line interface: ``evcharge compare | run | plot``."""
+"""Command-line interface: ``evcharge compare | run | plot | ocpp-server | ocpp-demo``."""
 
 from __future__ import annotations
 
@@ -142,7 +142,77 @@ def build_parser() -> argparse.ArgumentParser:
     _add_policy_args(p_plot, ["uncontrolled", "mpc", "optimal"])
     p_plot.add_argument("--output", required=True, help="image path, e.g. docs/workplace.png")
     p_plot.add_argument("--dpi", type=int, default=110, help="resolution (default 110)")
+
+    p_srv = sub.add_parser(
+        "ocpp-server", help="run an OCPP 1.6-J central system (needs the [ocpp] extra)"
+    )
+    p_srv.add_argument("--config", required=True, help="site and control settings (JSON)")
+    p_srv.add_argument("--host", default="127.0.0.1", help="listen address (default 127.0.0.1)")
+    p_srv.add_argument("--port", type=int, default=9000, help="TCP port (default 9000)")
+    p_srv.add_argument("--prefix", default="ocpp", help="URL path before the charge point id")
+
+    p_demo = sub.add_parser(
+        "ocpp-demo",
+        help="central system plus simulated charge points on an accelerated clock",
+    )
+    p_demo.add_argument("--chargers", type=int, default=10, help="charge points (default 10)")
+    p_demo.add_argument("--grid-limit", type=float, default=22.0, help="site limit in kW")
+    p_demo.add_argument(
+        "--policy", choices=list(POLICY_FACTORIES), default="llf", help="policy (default llf)"
+    )
+    p_demo.add_argument(
+        "--scale", type=float, default=600.0, help="simulated seconds per second (default 600)"
+    )
+    p_demo.add_argument("--seed", type=int, default=1, help="seed of the EV needs (default 1)")
     return parser
+
+
+def _ocpp_server(args: argparse.Namespace) -> None:
+    import asyncio
+    import logging
+
+    from evcharge.ocpp import CentralSystem, load_config, serve
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    system = CentralSystem(load_config(args.config))
+
+    async def main() -> None:
+        server = await serve(system, args.host, args.port, args.prefix)
+        print(f"listening on ws://{args.host}:{args.port}/{args.prefix}/<chargePointId>")
+        try:
+            await system.run_control()
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    asyncio.run(main())
+
+
+def _ocpp_demo(args: argparse.Namespace) -> None:
+    import asyncio
+
+    from evcharge.ocpp import CentralSystemConfig, run_demo
+    from evcharge.ocpp.demo import demo_fleet
+
+    if args.chargers < 1 or args.scale <= 0:
+        raise ValidationError("--chargers must be >= 1 and --scale > 0")
+    config = CentralSystemConfig(
+        grid_limit_kw=args.grid_limit, policy=args.policy, interval_s=900.0 / args.scale
+    )
+    fleet = demo_fleet(args.chargers, args.seed)
+    result = asyncio.run(run_demo(config, fleet, scale=args.scale))
+    print(
+        f"{len(fleet)} charge points, site limit {args.grid_limit:g} kW, policy {args.policy}, "
+        f"{result.control_steps} control steps"
+    )
+    print(f"highest planned site power: {max(result.planned_kw, default=0.0):.1f} kW")
+    print(f"highest sampled site power: {result.max_site_kw:.1f} kW")
+    print(f"{'charge point':<13} {'need kWh':>9} {'stay h':>7} {'got kWh':>8} {'profiles':>9}")
+    for i, (ev, log) in enumerate(result.logs):
+        print(
+            f"CP{i + 1:03d}{'':<8} {ev.energy_kwh:9.1f} {ev.stay_s / 3600:7.1f} "
+            f"{log.energy_wh / 1000:8.1f} {len(log.limits):9d}"
+        )
 
 
 def _options(args: argparse.Namespace) -> ScenarioOptions:
@@ -215,6 +285,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Entry point of the ``evcharge`` command; returns the exit status."""
     args = build_parser().parse_args(argv)
     try:
+        if args.command == "ocpp-server":
+            _ocpp_server(args)
+            return 0
+        if args.command == "ocpp-demo":
+            _ocpp_demo(args)
+            return 0
         scenario = _scenario_from_args(args)
         policies = _policies(args)
         if args.command == "plot":

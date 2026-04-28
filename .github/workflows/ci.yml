@@ -24,7 +24,7 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e ".[plot,dev]"
+          python -m pip install -e ".[plot,ocpp,dev]"
 
       - name: Lint (ruff)
         run: ruff check .
