@@ -2,15 +2,17 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
+from dataclasses import replace
 
 import numpy as np
 import pytest
 
+from evcharge import scenarios
 from evcharge.electrical import Supply
 from evcharge.model import Charger, Scenario, Session
-from evcharge.policies import OnlinePolicy, OptimalSchedule, Uncontrolled
+from evcharge.policies import OnlinePolicy, OptimalSchedule, Uncontrolled, make_policy
 from evcharge.policies.base import Observation
-from evcharge.sim import ViolationKind, simulate
+from evcharge.sim import ViolationKind, first_step, simulate
 
 from .helpers import make_scenario, session
 
@@ -189,3 +191,17 @@ def test_phase_aware_physics_and_line_currents() -> None:
     assert res.line_current_a is not None
     np.testing.assert_allclose(res.line_current_a, [[16.0, 0.0, 0.0], [0.0, 0.0, 0.0]])
     assert res.violations == ()
+
+
+@pytest.mark.parametrize("name", ["llf", "equal-share", "mpc", "optimal"])
+def test_first_step_is_the_first_step_of_a_simulation(name: str) -> None:
+    sc = scenarios.generate("residential", n_sessions=8, seed=3, grid="TN")
+    sc = sc.with_sessions(
+        tuple(replace(s, arrival_step=0) for s in sc.sessions if s.arrival_step < 30)
+    )
+    cmd, violations = first_step(sc, make_policy(name))
+    res = simulate(sc, make_policy(name))
+    assert violations == ()
+    assert res.setpoint is not None
+    expected = {s.id: float(res.setpoint[i, 0]) for i, s in enumerate(sc.sessions)}
+    assert {sid: v for sid, v in expected.items() if v} == pytest.approx(cmd)

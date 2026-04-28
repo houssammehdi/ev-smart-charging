@@ -212,6 +212,86 @@ def _enforce(
     return fitted
 
 
+class _Context:
+    """Per-scenario data the simulator needs at every step."""
+
+    def __init__(self, scenario: Scenario) -> None:
+        self.scenario = scenario
+        self.sessions = scenario.sessions
+        self.bounds = [scenario.power_bounds(s) for s in self.sessions]
+        self.controls = [scenario.control(s) for s in self.sessions]
+        self.coefficients = {s.id: scenario.row_coefficients(s) for s in self.sessions}
+        self.discharge_coef = {
+            s.id: scenario.row_discharge_coefficients(s)
+            for s, ctl in zip(self.sessions, self.controls, strict=True)
+            if ctl.can_discharge
+        }
+        self.headroom = scenario.ev_headroom_kw
+
+    def observe(
+        self, t: int, delivered: FloatArray, battery: FloatArray, peak: float
+    ) -> tuple[dict[str, SessionState], StepConstraints, Observation]:
+        """States of the connected sessions, the step's rows and the observation."""
+        dt = self.scenario.horizon.dt_h
+        states: dict[str, SessionState] = {}
+        for i, s in enumerate(self.sessions):
+            if s.is_connected(t):
+                states[s.id] = SessionState(
+                    session=s,
+                    delivered_kwh=float(delivered[i]),
+                    p_min_kw=self.bounds[i][0],
+                    p_max_kw=self.bounds[i][1],
+                    steps_left=s.departure_step - t,
+                    dt_h=dt,
+                    control_spec=self.controls[i],
+                    battery_kwh=None if s.v2g is None else float(battery[i]),
+                )
+        rows = self.scenario.rows
+        step_rows = StepConstraints(
+            rows.names,
+            rows.kinds,
+            rows.rhs[t],
+            {sid: self.coefficients[sid] for sid in states},
+            {sid: self.discharge_coef[sid] for sid in states if sid in self.discharge_coef},
+        )
+        obs = Observation(
+            step=t,
+            sessions=tuple(states.values()),
+            headroom_kw=float(self.headroom[t]),
+            peak_import_kw=peak,
+            constraints=step_rows,
+        )
+        return states, step_rows, obs
+
+
+def _initial_battery(scenario: Scenario) -> FloatArray:
+    return np.array([np.nan if s.v2g is None else s.v2g.initial_kwh for s in scenario.sessions])
+
+
+def first_step(
+    scenario: Scenario, policy: Policy, *, peak_import_kw: float = 0.0
+) -> tuple[dict[str, float], tuple[Violation, ...]]:
+    """Reset ``policy`` on ``scenario`` and return its checked commands for step 0.
+
+    This is how a live controller uses a policy: describe the site *now* as a
+    scenario whose connected EVs start at step 0 with their remaining request,
+    and apply the first step. The commands are enforced exactly as in
+    :func:`simulate` (setpoint units of each session's control).
+
+    Args:
+        scenario: The site now.
+        policy: Any policy.
+        peak_import_kw: Peak import already incurred in the billing period.
+    """
+    policy.reset(scenario if policy.clairvoyant else scenario.without_sessions())
+    ctx = _Context(scenario)
+    delivered = np.zeros(len(scenario.sessions))
+    states, step_rows, obs = ctx.observe(0, delivered, _initial_battery(scenario), peak_import_kw)
+    violations: list[Violation] = []
+    cmd = _enforce(0, dict(policy.decide(obs)), states, step_rows, violations)
+    return cmd, tuple(violations)
+
+
 def simulate(scenario: Scenario, policy: Policy) -> SimulationResult:
     """Run ``policy`` on ``scenario`` and return the full trajectory.
 
@@ -220,6 +300,7 @@ def simulate(scenario: Scenario, policy: Policy) -> SimulationResult:
     """
     started = time.perf_counter()
     policy.reset(scenario if policy.clairvoyant else scenario.without_sessions())
+    ctx = _Context(scenario)
 
     horizon = scenario.horizon
     n_t = horizon.n_steps
@@ -227,56 +308,21 @@ def simulate(scenario: Scenario, policy: Policy) -> SimulationResult:
     sessions = scenario.sessions
     n_s = len(sessions)
     index = {s.id: i for i, s in enumerate(sessions)}
-    bounds = [scenario.power_bounds(s) for s in sessions]
-    controls = [scenario.control(s) for s in sessions]
-    coefficients = {s.id: scenario.row_coefficients(s) for s in sessions}
-    discharge_coef = {
-        s.id: scenario.row_discharge_coefficients(s)
-        for s, ctl in zip(sessions, controls, strict=True)
-        if ctl.can_discharge
-    }
-    rows = scenario.rows
-    headroom = scenario.ev_headroom_kw
+    controls = ctx.controls
     net_base = scenario.net_base_kw
 
     setpoint = np.zeros((n_s, n_t))
     setpoint_kw = np.zeros((n_s, n_t))
     power = np.zeros((n_s, n_t))
     delivered = np.zeros(n_s)
-    battery = np.array([np.nan if s.v2g is None else s.v2g.initial_kwh for s in sessions])
+    battery = _initial_battery(scenario)
     battery_log = np.full((n_s, n_t), np.nan)
     net_import = np.zeros(n_t)
     violations: list[Violation] = []
     peak = 0.0
 
     for t in range(n_t):
-        states: dict[str, SessionState] = {}
-        for i, s in enumerate(sessions):
-            if s.is_connected(t):
-                states[s.id] = SessionState(
-                    session=s,
-                    delivered_kwh=float(delivered[i]),
-                    p_min_kw=bounds[i][0],
-                    p_max_kw=bounds[i][1],
-                    steps_left=s.departure_step - t,
-                    dt_h=dt,
-                    control_spec=controls[i],
-                    battery_kwh=None if s.v2g is None else float(battery[i]),
-                )
-        step_rows = StepConstraints(
-            rows.names,
-            rows.kinds,
-            rows.rhs[t],
-            {sid: coefficients[sid] for sid in states},
-            {sid: discharge_coef[sid] for sid in states if sid in discharge_coef},
-        )
-        obs = Observation(
-            step=t,
-            sessions=tuple(states.values()),
-            headroom_kw=float(headroom[t]),
-            peak_import_kw=peak,
-            constraints=step_rows,
-        )
+        states, step_rows, obs = ctx.observe(t, delivered, battery, peak)
         raw = dict(policy.decide(obs))
         cmd = _enforce(t, raw, states, step_rows, violations)
         for sid, c in cmd.items():
