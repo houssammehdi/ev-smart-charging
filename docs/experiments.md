@@ -8,6 +8,22 @@ study is in [phases.md](phases.md) and the V2G study in [v2g.md](v2g.md).
 
 ## 1. Policies on the built-in scenarios
 
+| policy | knows | rule |
+|---|---|---|
+| `uncontrolled` | connected EVs | full power on plug-in; when a limit is hit, earlier arrivals keep full power (static load balancer, FCFS) |
+| `equal-share` | connected EVs | water-filling split of the capacity; if not every EV can get the minimum, the least-served EVs go first, so access rotates |
+| `edf` | + declared departures | earliest departure first, each up to full power |
+| `llf` | + declared energy | least laxity first; laxity = time left - time needed at full power |
+| `price-aware` | + price, base-load and PV forecasts | EVs in least-laxity order book the cheapest free capacity in their window, re-planned every step |
+| `mpc` | + everything declared so far | solves the LP/MILP from now to the last known departure and applies the first step |
+| `mpc-reserve`, `mpc-ev`, `mpc-saa` | + an arrival forecast | MPC with a capacity reserve, expected ghost EVs, or sampled futures (section 2) |
+| `optimal` | **all sessions in advance** | one LP/MILP over the whole horizon, replayed: the benchmark, not a deployable controller |
+
+All heuristics allocate against the same capacity rows as the simulator (one per line on
+phase-aware sites), never command a non-zero current below the 6 A minimum, and put setpoints
+on the charger's resolution.
+
+
 The numbers below are pasted from runs of the commands shown, at commit time, with seed 7. The
 scenarios are seeded and HiGHS is deterministic, so the same package versions reproduce them
 exactly. Each command takes about 2 to 4 s in the development container. Costs are site-level:
