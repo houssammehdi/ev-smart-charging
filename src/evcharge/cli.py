@@ -1,4 +1,4 @@
-"""Command-line interface: ``evcharge compare | run | plot | ocpp-server | ocpp-demo``."""
+"""Command-line interface: ``evcharge compare | run | plot | report | ocpp-server | ocpp-demo``."""
 
 from __future__ import annotations
 
@@ -159,6 +159,12 @@ def build_parser() -> argparse.ArgumentParser:
     _add_policy_args(p_plot, ["uncontrolled", "mpc", "optimal"])
     p_plot.add_argument("--output", required=True, help="image path, e.g. docs/workplace.png")
     p_plot.add_argument("--dpi", type=int, default=110, help="resolution (default 110)")
+
+    p_rep = sub.add_parser("report", help="write a self-contained HTML report of a comparison")
+    _add_scenario_args(p_rep)
+    p_rep.add_argument("--input", help="scenario JSON instead of a synthetic scenario")
+    _add_policy_args(p_rep, list(POLICY_FACTORIES))
+    p_rep.add_argument("--output", required=True, help="HTML path, e.g. report.html")
 
     p_srv = sub.add_parser(
         "ocpp-server", help="run an OCPP 1.6-J central system (needs the [ocpp] extra)"
@@ -329,7 +335,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         scenario = _scenario_from_args(args)
         policies = _policies(args)
-        if args.command == "plot":
+        if args.command == "report":
+            from pathlib import Path
+
+            from evcharge.report import html_report
+
+            out = Path(args.output)
+            out.write_text(html_report(compare(scenario, policies)), encoding="utf-8")
+            print(f"wrote {out}")
+        elif args.command == "plot":
             from evcharge.plotting import save_power_plot
             from evcharge.sim import simulate
 
