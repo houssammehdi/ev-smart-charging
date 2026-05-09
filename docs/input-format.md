@@ -179,3 +179,31 @@ evcharge: error: base load minus PV exceeds the grid limit at step 68 (2026-04-1
 ```
 
 and exits with status 2.
+
+## ACN-Data sessions
+
+`evcharge run --acn FILE --grid-limit KW` reads charging sessions in the JSON format of the
+Caltech ACN-Data set (Lee, Li and Low 2019): an object whose `_items` list holds one record
+per session. The loader (`evcharge.acn`) uses `sessionID`, `stationID`, `connectionTime`,
+`disconnectTime`, `kWhDelivered` and, from the latest entry of `userInputs`, `kWhRequested`
+and `requestedDeparture`. Timestamps may be RFC 1123 (`"Wed, 25 Apr 2018 11:08:04 GMT"`) or
+ISO 8601 with an offset. Nothing is downloaded; the user supplies the file.
+
+- One charger per `stationID`, 6.6 kW (32 A at 208 V) with a 1.25 kW minimum (6 A at 208 V),
+  on the aggregate kW model; `acn_scenario(...)` takes other values.
+- The energy is `kWhDelivered` (metered at the station, so `efficiency` is 1), or the driver's
+  `kWhRequested` with `--acn-energy requested`. The departure is `disconnectTime`, or the
+  driver's `requestedDeparture` with `--acn-departure requested` (never later than the actual
+  disconnect). Records without user input fall back to the delivered energy and actual
+  departure.
+- Arrivals are rounded up and departures down to the step. Sessions shorter than one step are
+  left out, and energies are capped at what the charger can deliver in the rounded window;
+  the command reports how many.
+- The tariff is a constant price (`acn_scenario(price_eur_per_kwh=...)`), with no base load.
+
+[`examples/acn-sample.json`](../examples/acn-sample.json) is a small **hand-made** file in this
+format (it says so in its `_meta` block); it is not ACN data.
+
+```bash
+evcharge run --acn examples/acn-sample.json --grid-limit 15 --policies uncontrolled llf mpc optimal
+```

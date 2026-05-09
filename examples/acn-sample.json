@@ -1,0 +1,172 @@
+{
+  "_meta": {
+    "note": "Hand-made sample in the ACN-Data JSON format for tests and examples. These are not real sessions and not data from the Adaptive Charging Network.",
+    "total": 8
+  },
+  "_items": [
+    {
+      "_id": "sample-01",
+      "clusterID": "0000",
+      "connectionTime": "Wed, 15 Apr 2026 15:05:00 GMT",
+      "disconnectTime": "Wed, 15 Apr 2026 23:40:00 GMT",
+      "doneChargingTime": "Wed, 15 Apr 2026 18:10:00 GMT",
+      "kWhDelivered": 14.2,
+      "sessionID": "sample-session-01",
+      "siteID": "0000",
+      "spaceID": "SAMPLE-1",
+      "stationID": "sample-station-1",
+      "timezone": "America/Los_Angeles",
+      "userID": 1001,
+      "userInputs": [
+        {
+          "WhPerMile": 300,
+          "kWhRequested": 16.0,
+          "milesRequested": 53,
+          "minutesAvailable": 480,
+          "modifiedAt": "Wed, 15 Apr 2026 15:05:00 GMT",
+          "paymentRequired": true,
+          "requestedDeparture": "Wed, 15 Apr 2026 23:30:00 GMT",
+          "userID": 1001
+        }
+      ]
+    },
+    {
+      "_id": "sample-02",
+      "clusterID": "0000",
+      "connectionTime": "Wed, 15 Apr 2026 15:20:00 GMT",
+      "disconnectTime": "Wed, 15 Apr 2026 19:55:00 GMT",
+      "doneChargingTime": "Wed, 15 Apr 2026 17:45:00 GMT",
+      "kWhDelivered": 9.8,
+      "sessionID": "sample-session-02",
+      "siteID": "0000",
+      "spaceID": "SAMPLE-2",
+      "stationID": "sample-station-2",
+      "timezone": "America/Los_Angeles",
+      "userID": null,
+      "userInputs": null
+    },
+    {
+      "_id": "sample-03",
+      "clusterID": "0000",
+      "connectionTime": "Wed, 15 Apr 2026 15:40:00 GMT",
+      "disconnectTime": "Thu, 16 Apr 2026 00:10:00 GMT",
+      "doneChargingTime": "Wed, 15 Apr 2026 20:05:00 GMT",
+      "kWhDelivered": 21.5,
+      "sessionID": "sample-session-03",
+      "siteID": "0000",
+      "spaceID": "SAMPLE-3",
+      "stationID": "sample-station-3",
+      "timezone": "America/Los_Angeles",
+      "userID": 1003,
+      "userInputs": [
+        {
+          "WhPerMile": 300,
+          "kWhRequested": 25.0,
+          "milesRequested": 83,
+          "minutesAvailable": 480,
+          "modifiedAt": "Wed, 15 Apr 2026 15:40:00 GMT",
+          "paymentRequired": true,
+          "requestedDeparture": "Thu, 16 Apr 2026 00:00:00 GMT",
+          "userID": 1003
+        }
+      ]
+    },
+    {
+      "_id": "sample-04",
+      "clusterID": "0000",
+      "connectionTime": "Wed, 15 Apr 2026 16:00:00 GMT",
+      "disconnectTime": "Wed, 15 Apr 2026 21:30:00 GMT",
+      "doneChargingTime": "Wed, 15 Apr 2026 18:20:00 GMT",
+      "kWhDelivered": 12.0,
+      "sessionID": "sample-session-04",
+      "siteID": "0000",
+      "spaceID": "SAMPLE-4",
+      "stationID": "sample-station-4",
+      "timezone": "America/Los_Angeles",
+      "userID": 1004,
+      "userInputs": [
+        {
+          "WhPerMile": 300,
+          "kWhRequested": 10.0,
+          "milesRequested": 33,
+          "minutesAvailable": 480,
+          "modifiedAt": "Wed, 15 Apr 2026 16:00:00 GMT",
+          "paymentRequired": true,
+          "requestedDeparture": "Wed, 15 Apr 2026 22:00:00 GMT",
+          "userID": 1004
+        }
+      ]
+    },
+    {
+      "_id": "sample-05",
+      "clusterID": "0000",
+      "connectionTime": "Wed, 15 Apr 2026 20:30:00 GMT",
+      "disconnectTime": "Thu, 16 Apr 2026 01:15:00 GMT",
+      "doneChargingTime": "Wed, 15 Apr 2026 22:40:00 GMT",
+      "kWhDelivered": 8.4,
+      "sessionID": "sample-session-05",
+      "siteID": "0000",
+      "spaceID": "SAMPLE-2",
+      "stationID": "sample-station-2",
+      "timezone": "America/Los_Angeles",
+      "userID": null,
+      "userInputs": null
+    },
+    {
+      "_id": "sample-06",
+      "clusterID": "0000",
+      "connectionTime": "Wed, 15 Apr 2026 16:25:00 GMT",
+      "disconnectTime": "Wed, 15 Apr 2026 16:35:00 GMT",
+      "doneChargingTime": null,
+      "kWhDelivered": 0.4,
+      "sessionID": "sample-session-06",
+      "siteID": "0000",
+      "spaceID": "SAMPLE-5",
+      "stationID": "sample-station-5",
+      "timezone": "America/Los_Angeles",
+      "userID": null,
+      "userInputs": null
+    },
+    {
+      "_id": "sample-07",
+      "clusterID": "0000",
+      "connectionTime": "Wed, 15 Apr 2026 22:10:00 GMT",
+      "disconnectTime": "Thu, 16 Apr 2026 02:45:00 GMT",
+      "doneChargingTime": "Thu, 16 Apr 2026 00:30:00 GMT",
+      "kWhDelivered": 11.1,
+      "sessionID": "sample-session-07",
+      "siteID": "0000",
+      "spaceID": "SAMPLE-4",
+      "stationID": "sample-station-4",
+      "timezone": "America/Los_Angeles",
+      "userID": 1007,
+      "userInputs": [
+        {
+          "WhPerMile": 300,
+          "kWhRequested": 12.0,
+          "milesRequested": 40,
+          "minutesAvailable": 480,
+          "modifiedAt": "Wed, 15 Apr 2026 22:10:00 GMT",
+          "paymentRequired": true,
+          "requestedDeparture": "Thu, 16 Apr 2026 02:30:00 GMT",
+          "userID": 1007
+        }
+      ]
+    },
+    {
+      "_id": "sample-08",
+      "clusterID": "0000",
+      "connectionTime": "Thu, 16 Apr 2026 00:05:00 GMT",
+      "disconnectTime": "Thu, 16 Apr 2026 02:00:00 GMT",
+      "doneChargingTime": "Thu, 16 Apr 2026 01:50:00 GMT",
+      "kWhDelivered": 7.9,
+      "sessionID": "sample-session-08",
+      "siteID": "0000",
+      "spaceID": "SAMPLE-1",
+      "stationID": "sample-station-1",
+      "timezone": "America/Los_Angeles",
+      "userID": null,
+      "userInputs": null
+    }
+  ]
+}

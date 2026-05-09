@@ -131,8 +131,25 @@ def build_parser() -> argparse.ArgumentParser:
     _add_policy_args(p_cmp, list(POLICY_FACTORIES))
     _add_format_arg(p_cmp)
 
-    p_run = sub.add_parser("run", help="compare policies on a scenario JSON file")
-    p_run.add_argument("--input", required=True, help="scenario JSON (see docs/input-format.md)")
+    p_run = sub.add_parser("run", help="compare policies on a scenario JSON or ACN-Data file")
+    source = p_run.add_mutually_exclusive_group(required=True)
+    source.add_argument("--input", help="scenario JSON (see docs/input-format.md)")
+    source.add_argument("--acn", help="sessions in the Caltech ACN-Data JSON format")
+    acn = p_run.add_argument_group("ACN-Data (with --acn)")
+    acn.add_argument("--grid-limit", type=float, default=None, help="site limit in kW")
+    acn.add_argument(
+        "--acn-energy",
+        choices=["delivered", "requested"],
+        default="delivered",
+        help="session energy: kWhDelivered or the driver's kWhRequested (default delivered)",
+    )
+    acn.add_argument(
+        "--acn-departure",
+        choices=["actual", "requested"],
+        default="actual",
+        help="departure: disconnectTime or the driver's requestedDeparture (default actual)",
+    )
+    acn.add_argument("--step-minutes", type=int, default=15, help="control step (default 15)")
     _add_policy_args(p_run, list(POLICY_FACTORIES))
     _add_format_arg(p_run)
 
@@ -234,6 +251,25 @@ def _options(args: argparse.Namespace) -> ScenarioOptions:
 
 
 def _scenario_from_args(args: argparse.Namespace) -> Scenario:
+    if getattr(args, "acn", None):
+        from evcharge.acn import load_acn
+
+        if args.grid_limit is None:
+            raise ValidationError("--acn needs --grid-limit (kW)")
+        loaded = load_acn(
+            args.acn,
+            grid_limit_kw=args.grid_limit,
+            step_minutes=args.step_minutes,
+            energy=args.acn_energy,
+            departure=args.acn_departure,
+        )
+        if loaded.dropped or loaded.capped:
+            print(
+                f"ACN-Data: {len(loaded.dropped)} sessions shorter than one step left out, "
+                f"{len(loaded.capped)} capped at what fits their window",
+                file=sys.stderr,
+            )
+        return loaded.scenario
     if getattr(args, "input", None):
         return load_scenario(args.input)
     return generate(args.scenario, **_options(args))
@@ -243,7 +279,7 @@ def _forecast(args: argparse.Namespace) -> ArrivalForecast:
     """The forecast of the forecast-aware policies: from --history, else synthetic days."""
     if args.history:
         return ArrivalForecast.fit([load_scenario(f) for f in args.history])
-    if getattr(args, "input", None):
+    if getattr(args, "input", None) or getattr(args, "acn", None):
         raise ValidationError("forecast-aware policies need --history for a scenario file")
     return ArrivalForecast.fit(training_days(args.scenario, args.train_days, **_options(args)))
 
