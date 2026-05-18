@@ -135,7 +135,8 @@ def _opt_num(obj: dict[str, object], key: str, where: str) -> float | None:
     return None if value is None else _num(value, f"{where}.{key}")
 
 
-def _parse_supply(value: object) -> Supply:
+def parse_supply(value: object) -> Supply:
+    """Parse a ``site.supply`` block (grid type, line limits, voltage)."""
     obj = _obj(value, "site.supply")
     raw = _get(obj, "line_limit_a", "site.supply")
     if isinstance(raw, list):
@@ -157,7 +158,8 @@ def _parse_supply(value: object) -> Supply:
         raise ValidationError(f"site.supply: {exc}") from None
 
 
-def _parse_charger(raw: object, where: str, phase_aware: bool) -> Charger:
+def parse_charger(raw: object, where: str, phase_aware: bool) -> Charger:
+    """Parse one ``site.chargers[]`` entry; ``where`` names it in error messages."""
     c = _obj(raw, where)
     phases = _int(c.get("phases", 3), f"{where}.phases")
     max_current = _opt_num(c, "max_current_a", where)
@@ -265,12 +267,12 @@ def scenario_from_dict(data: object) -> Scenario:
     )
 
     site_obj = _obj(_get(root, "site", "scenario"), "site")
-    supply = None if site_obj.get("supply") is None else _parse_supply(site_obj["supply"])
+    supply = None if site_obj.get("supply") is None else parse_supply(site_obj["supply"])
     raw_chargers = _get(site_obj, "chargers", "site")
     if not isinstance(raw_chargers, list):
         raise ValidationError("site.chargers: expected a list")
     chargers = tuple(
-        _parse_charger(raw, f"site.chargers[{i}]", supply is not None)
+        parse_charger(raw, f"site.chargers[{i}]", supply is not None)
         for i, raw in enumerate(raw_chargers)
     )
     if site_obj.get("grid_limit_kw") is None and supply is not None:

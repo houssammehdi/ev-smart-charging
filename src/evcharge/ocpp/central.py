@@ -44,7 +44,7 @@ from websockets.http11 import Request, Response
 from websockets.typing import Subprotocol
 
 from evcharge.electrical import Supply
-from evcharge.io import _parse_charger, _parse_supply
+from evcharge.io import parse_charger, parse_supply
 from evcharge.model import (
     ENERGY_TOL_KWH,
     Charger,
@@ -203,13 +203,13 @@ def config_from_dict(data: object) -> CentralSystemConfig:
         raise ValidationError("config: expected an object")
     root = {str(k): v for k, v in data.items()}
     site = _section(root, "site")
-    supply = None if site.get("supply") is None else _parse_supply(site["supply"])
+    supply = None if site.get("supply") is None else parse_supply(site["supply"])
     raw_chargers = site.get("chargers", [])
     if not isinstance(raw_chargers, list):
         raise ValidationError("site.chargers: expected a list")
     chargers: dict[str, Charger] = {}
     for i, raw in enumerate(raw_chargers):
-        c = _parse_charger(raw, f"site.chargers[{i}]", supply is not None)
+        c = parse_charger(raw, f"site.chargers[{i}]", supply is not None)
         key = c.id if "/" in c.id else f"{c.id}/1"
         chargers[key] = replace(c, id=key)
     template_raw: dict[str, object] = {"id": "template", **_section(root, "charger_template")}
@@ -217,7 +217,7 @@ def config_from_dict(data: object) -> CentralSystemConfig:
         supply is None or "max_current_a" not in template_raw
     ):
         template_raw["max_power_kw"] = 22.0
-    template = _parse_charger(template_raw, "charger_template", supply is not None)
+    template = parse_charger(template_raw, "charger_template", supply is not None)
     if site.get("grid_limit_kw") is None and supply is not None:
         grid_limit = supply.fuse_equivalent_kw
     else:
