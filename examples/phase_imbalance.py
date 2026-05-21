@@ -12,7 +12,7 @@ when the simulator enforces the line limit on its commands, which it does like
 a crude protective load balancer: every command on the overloaded line is
 scaled down in proportion and chargers pushed below 6 A pause.
 
-    python examples/phase_imbalance.py                    # tables, about 3 minutes
+    python examples/phase_imbalance.py                    # tables, a few minutes
     python examples/phase_imbalance.py --figure docs/figures/phase-imbalance.png
 """
 

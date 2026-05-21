@@ -26,7 +26,8 @@ on the charger's resolution.
 
 The numbers below are pasted from runs of the commands shown, at commit time, with seed 7. The
 scenarios are seeded and HiGHS is deterministic, so the same package versions reproduce them
-exactly. Each command takes about 2 to 4 s in the development container. Costs are site-level:
+exactly. Each command took 4 to 8 s of wall time (4-vCPU VM, 1-minute load average about 3
+from other jobs); most of it is MPC's 96 solves. Costs are site-level:
 they include the base load, so the differences between rows are what matter. `gap %` is the
 penalised cost above the LP lower bound.
 

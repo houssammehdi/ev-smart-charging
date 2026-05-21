@@ -92,7 +92,7 @@ installation holds L1 at the fuse and delivers 90.1 % of the energy, because L1 
 bottleneck. Bottom: with cyclic phase rotation of the chargers the same controller delivers
 everything.*
 
-The full comparison (`python examples/phase_imbalance.py`, about a minute; seed 7). "Plan before
+The full comparison (`python examples/phase_imbalance.py`, a few minutes; seed 7). "Plan before
 protection" is the kW-only plan with nothing stopping it. The first row is what happens when the
 simulator enforces the line limit on the kW-only commands. It acts like a crude protective load
 balancer: it scales every command on the overloaded line down in proportion, and chargers
