@@ -259,3 +259,65 @@ not update the expected number of later arrivals from the arrivals seen so far t
 are fluid (no minimum current), and ten samples are few for the tail. Conditioning the forecast
 on the day so far, a chance-constrained or robust reserve, or a fallback to least-laxity
 ordering when the plan's slack runs out are natural next steps; none of them is implemented.
+
+## 3. How do the solvers scale?
+
+`examples/scalability.py` times the solvers on residential scenarios (overnight stays of 11 to
+20 hours, the longest windows of the built-in profiles) on the aggregate kW model with the
+4.14 kW minimum, so the full MILP has one binary per session and step in its window. It
+measures the LP relaxation (`relaxation_bound`), relax-and-fix (the default of the offline
+optimum), the exact MILP stopped at a 0.1 % gap or after 60 s, and one MPC decision with every
+EV connected at once (the worst step: the longest local horizon and a binary per EV). The fleet
+sweep uses 96 steps of 15 minutes; the horizon sweep uses 50 sessions at 60, 30, 15 and 5 minute
+steps (24 to 288 steps per day). Every time is the median of 3 runs.
+
+```text
+$ python examples/scalability.py --csv scaling.csv                # 15 minutes
+$ python examples/scalability.py --figure docs/figures/scalability.png --from scaling.csv
+```
+
+The machine was not idle: other jobs kept the 1-minute load average between 2.1 and 5.2 on the
+4-vCPU VM (the "max load" column), so the times are indicative, and probably somewhat
+pessimistic.
+
+**Fleet size, 96 steps** (median of 3 runs, seconds)
+
+| sessions | LP | relax-and-fix | exact MILP | MPC step | exact MILP result | max load |
+|---:|---:|---:|---:|---:|---|---:|
+| 10 | 0.01 | 0.15 | 16.77 | 0.03 | 538 binaries, optimal, gap 0.07 % | 3.29 |
+| 25 | 0.02 | 0.16 | 19.69 | 0.07 | 1393 binaries, optimal, gap 0.02 % | 5.04 |
+| 50 | 0.03 | 0.35 | 52.74 | 0.69 | 2770 binaries, optimal, gap 0.00 % | 5.19 |
+| 100 | 0.07 | 0.47 | 60.12 | 1.15 | 5469 binaries, time_limit, gap 59.64 % | 4.74 |
+| 200 | 0.14 | 1.01 | 60.11 | 0.99 | 10907 binaries, time_limit, gap 13.37 % | 4.74 |
+| 500 | 0.41 | 2.73 | - | 1.85 | not run | 4.80 |
+
+**Horizon length, 50 sessions** (median of 3 runs, seconds)
+
+| steps | LP | relax-and-fix | exact MILP | MPC step | exact MILP result | max load |
+|---:|---:|---:|---:|---:|---|---:|
+| 24 | 0.01 | 0.14 | 1.33 | 0.17 | 659 binaries, optimal, gap 0.00 % | 4.80 |
+| 48 | 0.02 | 0.15 | 4.99 | 0.28 | 1360 binaries, optimal, gap 0.00 % | 4.65 |
+| 96 | 0.03 | 0.35 | 52.74 | 0.69 | 2770 binaries, optimal, gap 0.00 % | 5.19 |
+| 288 | 0.12 | 4.33 | 60.09 | 1.76 | 8418 binaries, time_limit, gap 91.78 % | 4.29 |
+
+![Solve time](figures/scalability.png)
+
+- **The LP is cheap at every size**: 0.4 s for 500 EVs over a day, 0.12 s for 288 steps. The
+  lower bound can be computed for any realistic site.
+- **Relax-and-fix is what makes the minimum current tractable.** It needs 18 to 202 binaries
+  where the exact MILP needs 538 to 10,907, and it finishes in 0.15 to 4.3 s. Its gap to the LP
+  bound was at most 0.02 % from 25 sessions up, 2.62 % at 10 sessions and 0.56 % at 24 steps
+  per day, where a few EVs' minimum-current steps are a larger share of the total.
+- **The exact MILP does not scale.** It proves a 0.1 % gap within 17 to 53 s up to 50 sessions
+  and stops at the 60 s limit from 100 sessions on, with a gap of 60 % (100 sessions), 13 %
+  (200) and 92 % (288 steps). It was not run for 500 sessions. (MILP presolve is off, see
+  below; how much that costs here was not measured.)
+- **An MPC step stays below 2 s** with 500 EVs connected at once, well inside a 15-minute
+  control interval. A simulated day of MPC is 96 such steps with fewer EVs each.
+
+**Solver notes.** HiGHS is called through `scipy.optimize.linprog` and `scipy.optimize.milp`.
+MILP presolve is disabled because on some tiny instances its postsolve path re-ran the solver and
+printed debug output; coefficients below 1e-9 are snapped to zero because a hypothesis-generated
+price of 2.2e-308 stalled the MILP. The rounding MILP that puts a plan on the chargers'
+resolution stops at a 1 % relative gap rather than at a time limit, so results do not depend on
+the machine's speed.
