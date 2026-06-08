@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ev-smart-charging"
-version = "0.1.0"
-description = "Smart-charging scheduler and simulator for EV sites with limited grid capacity: heuristics vs. optimal LP vs. MPC."
+version = "0.2.0"
+description = "Smart EV charging under grid constraints: phase-aware heuristics, LP/MILP optimum, forecast-aware MPC, V2G and an OCPP 1.6-J central system."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -45,7 +45,7 @@ evcharge = "evcharge.cli:main"
 packages = ["src/evcharge"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src/evcharge", "tests", "examples", "README.md", "LICENSE"]
+include = ["src/evcharge", "tests", "examples", "docs", "README.md", "CHANGELOG.md", "LICENSE"]
 
 [tool.ruff]
 line-length = 100
